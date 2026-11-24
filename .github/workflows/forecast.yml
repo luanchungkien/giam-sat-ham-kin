@@ -1,0 +1,22 @@
+name: AI forecast
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # mỗi 15 phút (GitHub có thể trễ vài phút)
+  workflow_dispatch:          # cho phép bấm chạy tay
+
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - run: python ai/forecast.py
+        env:
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          AI_EMAIL: ${{ secrets.AI_EMAIL }}
+          AI_PASSWORD: ${{ secrets.AI_PASSWORD }}
