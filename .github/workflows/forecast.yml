@@ -21,20 +21,26 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          # Bắt buộc phải chỉ ra file phụ thuộc, nếu không setup-python báo:
+          # "No file ... matched to [**/requirements.txt or **/pyproject.toml]"
           cache: pip
+          cache-dependency-path: ai/requirements.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # numpy là bắt buộc; scikit-learn là tuỳ chọn (thiếu thì tự dùng z-score).
-          # Không cần statsmodels: mô hình dự báo dùng hồi quy về mức nền 24 giờ.
-          pip install numpy scikit-learn
+          pip install -r ai/requirements.txt
 
       - name: Run AI
         env:
-          FIREBASE_DB_URL: "https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app"
-          # Nếu Firebase Rules không cho ghi công khai, tạo secret FIREBASE_DB_AUTH
-          # rồi bỏ comment dòng dưới:
-          # FIREBASE_DB_AUTH: ${{ secrets.FIREBASE_DB_AUTH }}
+          # Dùng secret FIREBASE_DB_URL nếu có, không thì lấy URL mặc định
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL || 'https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app' }}
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          # Secret trong repo đang đặt tên là AI_EMAIL / AI_PASSWORD
+          FIREBASE_EMAIL: ${{ secrets.AI_EMAIL }}
+          FIREBASE_PASSWORD: ${{ secrets.AI_PASSWORD }}
           PYTHONUNBUFFERED: "1"
+        # Bước 1 (tuỳ chọn): kiểm tra đăng nhập, lỗi sẽ đọc được ngay
+        # run: python ai/forecast.py --check-auth
+        # Bước 2: chạy thật (bỏ run của --check-auth ở trên rồi dùng dòng dưới)
         run: python ai/forecast.py
