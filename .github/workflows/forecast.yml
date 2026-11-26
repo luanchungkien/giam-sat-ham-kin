@@ -1,12 +1,15 @@
-
 name: AI Forecast Job
 
 on:
+  # Cron của GitHub là "best-effort": repo ít hoạt động thì có lúc bị bỏ qua
+  # hàng giờ. Vì vậy ngoài schedule còn có push + workflow_dispatch để bù.
   schedule:
-    - cron: '*/30 * * * *' # Chạy mỗi 30 phút
-  workflow_dispatch:
+    - cron: '*/30 * * * *' # Ý định: 30 phút/lần (GitHub có thể trễ/bỏ)
+  push:
+    branches: [main]       # mỗi lần push là chạy lại AI ngay
+  workflow_dispatch: # Bấm chạy thủ công trên tab Actions
 
-# Không cho 2 lần chạy chồng nhau
+# Không cho 2 lần chạy chồng nhau (tránh ghi đè /predictions/latest lộn xộn)
 concurrency:
   group: ai-forecast
   cancel-in-progress: false
@@ -15,7 +18,6 @@ jobs:
   run-ai:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - uses: actions/checkout@v4
 
@@ -23,26 +25,32 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          # KHÔNG bật "cache: pip" ở đây: setup-python bắt buộc phải có
+          # requirements.txt/pyproject.toml để tính cache key, thiếu là fail.
+          # Khi đã thêm ai/requirements.txt thì bật lại bằng 2 dòng:
+          #   cache: pip
+          #   cache-dependency-path: ai/requirements.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-
           if [ -f ai/requirements.txt ]; then
-            echo "Tim thay requirements.txt"
+            echo "Cài theo ai/requirements.txt"
             pip install -r ai/requirements.txt
           else
-            echo "Khong tim thay requirements.txt"
-            echo "Tien hanh cai thu vien truc tiep"
+            echo "Chưa có ai/requirements.txt -> cài trực tiếp"
             pip install numpy scikit-learn
           fi
 
       - name: Run AI
         env:
+          # Dùng secret FIREBASE_DB_URL nếu có, không thì lấy URL mặc định
           FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL || 'https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app' }}
           FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          # Secret trong repo đang đặt tên là AI_EMAIL / AI_PASSWORD
           FIREBASE_EMAIL: ${{ secrets.AI_EMAIL }}
           FIREBASE_PASSWORD: ${{ secrets.AI_PASSWORD }}
           PYTHONUNBUFFERED: "1"
-
+        # Muốn chỉ kiểm tra đăng nhập trước: đổi thành
+        #   run: python ai/forecast.py --check-auth
         run: python ai/forecast.py
