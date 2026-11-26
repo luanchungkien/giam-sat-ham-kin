@@ -17,7 +17,8 @@ Biến môi trường:
     AI_OUTPUT_PATH      mặc định "predictions/latest"
     AI_LOOKBACK_HOURS   mặc định 24
     ENABLE_WEATHER      "0" để tắt gọi Open-Meteo
-    SITE_LAT / SITE_LON toạ độ so sánh với thành phố (mặc định Hà Nội)
+    SITE_LAT / SITE_LON / SITE_NAME / SITE_TZ  trạm so sánh thời tiết (mặc định Thái Nguyên)
+    AI_BIAS_DECAY_MIN   hằng số tắt dần khi neo dự báo vào giá trị hiện tại (phút)
 
 Phụ thuộc:
     bắt buộc : numpy
@@ -62,10 +63,16 @@ DB_AUTH = os.environ.get("FIREBASE_DB_AUTH", "").strip()
 OUTPUT_PATH = os.environ.get("AI_OUTPUT_PATH", "predictions/latest").strip("/")
 LOOKBACK_HOURS = float(os.environ.get("AI_LOOKBACK_HOURS", "24"))
 WEATHER_ENABLED = os.environ.get("ENABLE_WEATHER", "1") not in ("0", "false", "False", "")
-SITE_LAT = os.environ.get("SITE_LAT", "21.0285")
-SITE_LON = os.environ.get("SITE_LON", "105.8542")
+# Trạm so sánh: Thái Nguyên (đổi bằng biến môi trường nếu cần)
+SITE_NAME = os.environ.get("SITE_NAME", "Thái Nguyên")
+SITE_TZ = os.environ.get("SITE_TZ", "Asia/Ho_Chi_Minh")
+SITE_LAT = os.environ.get("SITE_LAT", "21.5942")
+SITE_LON = os.environ.get("SITE_LON", "105.8481")
 TIMEOUT = float(os.environ.get("AI_HTTP_TIMEOUT", "10"))
 STALE_SEC = float(os.environ.get("AI_STALE_SEC", "180"))
+# Dự báo được "neo" vào giá trị cảm biến hiện tại rồi tắt dần sai lệch,
+# để điểm +1h không nhảy cóc so với số đang hiển thị (đơn vị: phút).
+BIAS_DECAY_MIN = float(os.environ.get("AI_BIAS_DECAY_MIN", "120"))
 
 SCHEMA_VERSION = 2
 
@@ -338,8 +345,13 @@ def _fallback_forecast(series, horizons):
     return out, "linear"
 
 
-def forecast_metric(series, metric, horizons=HORIZONS):
-    """Trả về (list giá trị dự báo cùng độ dài horizons, phương pháp) hoặc (None, lý do)."""
+def forecast_metric(series, metric, horizons=HORIZONS, anchor=None):
+    """Trả về (list giá trị dự báo cùng độ dài horizons, phương pháp) hoặc (None, lý do).
+
+    `anchor`: giá trị cảm biến hiện tại. Dự báo được neo vào giá trị này rồi
+    tắt dần sai lệch (BIAS_DECAY_MIN), nhờ vậy điểm +1h không nhảy cóc so với
+    số đang hiển thị trên dashboard.
+    """
     spec = METRICS[metric]
     if len(series) < spec["minSamples"]:
         return None, "insufficient"
@@ -375,13 +387,22 @@ def forecast_metric(series, metric, horizons=HORIZONS):
     if raw is None:
         raw, method = _fallback_forecast(series, horizons)
 
+    # Neo vào giá trị hiện tại: lệch giữa "mẫu cuối của chuỗi" và "cảm biến bây giờ"
+    # được cộng vào dự báo rồi tắt dần, để đường dự báo nối liền với số đang hiển thị.
+    last = float(values[-1])
+    offset = 0.0 if anchor is None else float(anchor) - last
+    reference = last + offset                      # = anchor nếu có
+    corrected = [
+        value + offset * math.exp(-horizon / BIAS_DECAY_MIN)
+        for horizon, value in zip(horizons, raw)
+    ]
+
     # Kẹp tốc độ biến thiên: dự báo 6 giờ không thể nhảy xa hơn `rate` mỗi giờ,
     # tránh trường hợp ARIMA/ngoại suy tuyến tính cho ra con số vô lý.
-    last = float(values[-1])
     limited = []
-    for horizon, value in zip(horizons, raw):
+    for horizon, value in zip(horizons, corrected):
         span = spec["rate"] * horizon / 60.0
-        limited.append(max(last - span, min(last + span, value)))
+        limited.append(max(reference - span, min(reference + span, value)))
 
     # Kẹp về khoảng vật lý hợp lý để không hiển thị số vô lý
     cleaned = [
@@ -448,8 +469,10 @@ def detect_anomaly(records, current):
 def fetch_weather():
     ctx = {
         "ok": False,
+        "city": SITE_NAME,
         "lat": _num(SITE_LAT),
         "lon": _num(SITE_LON),
+        "tz": SITE_TZ,
         "cityTemp": None,
         "cityHum": None,
         "cityPm25": None,
@@ -461,7 +484,9 @@ def fetch_weather():
     try:
         url = (
             "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}"
-            "&current=temperature_2m,relative_humidity_2m&timezone=auto".format(SITE_LAT, SITE_LON)
+            "&current=temperature_2m,relative_humidity_2m&timezone={}".format(
+                SITE_LAT, SITE_LON, urllib.parse.quote(SITE_TZ)
+            )
         )
         data = _request("GET", url) or {}
         current = data.get("current") or {}
@@ -632,7 +657,7 @@ def analyse(dry_run=False, out_file=None):
     ready = {}
     for metric in ORDER:
         series = series_of(records, metric)
-        values, method = forecast_metric(series, metric)
+        values, method = forecast_metric(series, metric, anchor=current.get(metric))
         forecasts[metric] = values
         methods[metric] = method
         ready[metric] = values is not None
