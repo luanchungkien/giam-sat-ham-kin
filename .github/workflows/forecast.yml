@@ -1,28 +1,40 @@
-
 name: AI Forecast Job
 
 on:
   schedule:
     - cron: '*/30 * * * *' # Chạy mỗi 30 phút
-  workflow_dispatch:       # Cho phép bấm chạy thủ công
+  workflow_dispatch: # Cho phép bấm chạy thủ công
+
+# Không cho 2 lần chạy chồng nhau (tránh ghi đè /predictions/latest lộn xộn)
+concurrency:
+  group: ai-forecast
+  cancel-in-progress: false
 
 jobs:
   run-ai:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: pip
+
       - name: Install dependencies
         run: |
-          cd ai
-          pip install requests numpy pandas statsmodels scikit-learn
+          python -m pip install --upgrade pip
+          # numpy là bắt buộc; scikit-learn là tuỳ chọn (thiếu thì tự dùng z-score).
+          # Không cần statsmodels: mô hình dự báo dùng hồi quy về mức nền 24 giờ.
+          pip install numpy scikit-learn
+
       - name: Run AI
         env:
           FIREBASE_DB_URL: "https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app"
-        run: |
-          cd ai
-          python forecast.py
-
+          # Nếu Firebase Rules không cho ghi công khai, tạo secret FIREBASE_DB_AUTH
+          # rồi bỏ comment dòng dưới:
+          # FIREBASE_DB_AUTH: ${{ secrets.FIREBASE_DB_AUTH }}
+          PYTHONUNBUFFERED: "1"
+        run: python ai/forecast.py
