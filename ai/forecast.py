@@ -13,7 +13,12 @@ Chạy:
 
 Biến môi trường:
     FIREBASE_DB_URL     URL Realtime Database
-    FIREBASE_DB_AUTH    token (nối vào ?auth=), để trống nếu rules public
+    FIREBASE_DB_AUTH    token dán sẵn (nối vào ?auth=) — tuỳ chọn
+    FIREBASE_API_KEY    Web API key của project (để đăng nhập)
+    FIREBASE_EMAIL      tài khoản Firebase Auth mà Rules cho phép ghi (vd ai@gmail.com)
+    FIREBASE_PASSWORD   mật khẩu tài khoản đó
+                        (chấp nhận cả tên AI_EMAIL / AI_PASSWORD)
+                        -> nếu có đủ 3 biến này, script tự đăng nhập lấy idToken
     AI_OUTPUT_PATH      mặc định "predictions/latest"
     AI_LOOKBACK_HOURS   mặc định 24
     ENABLE_WEATHER      "0" để tắt gọi Open-Meteo
@@ -60,6 +65,14 @@ DB_URL = os.environ.get(
     "https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app",
 ).rstrip("/")
 DB_AUTH = os.environ.get("FIREBASE_DB_AUTH", "").strip()
+# Đăng nhập bằng tài khoản Email/Password (khuyến nghị, khớp Firebase Rules
+# kiểu: "predictions": { ".write": "auth.token.email == 'ai@gmail.com'" })
+# Nhận cả hai cách đặt tên: FIREBASE_EMAIL/FIREBASE_PASSWORD hoặc AI_EMAIL/AI_PASSWORD.
+FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", "").strip()
+FIREBASE_EMAIL = (os.environ.get("FIREBASE_EMAIL")
+                  or os.environ.get("AI_EMAIL") or "").strip()
+FIREBASE_PASSWORD = (os.environ.get("FIREBASE_PASSWORD")
+                     or os.environ.get("AI_PASSWORD") or "").strip()
 OUTPUT_PATH = os.environ.get("AI_OUTPUT_PATH", "predictions/latest").strip("/")
 LOOKBACK_HOURS = float(os.environ.get("AI_LOOKBACK_HOURS", "24"))
 WEATHER_ENABLED = os.environ.get("ENABLE_WEATHER", "1") not in ("0", "false", "False", "")
@@ -185,13 +198,71 @@ def _r(value, dec):
     return None if value is None else round(float(value), dec)
 
 
+# Token hiện tại: ưu tiên FIREBASE_DB_AUTH (dán sẵn), nếu không có thì đăng nhập.
+# "failed_at" để không thử đăng nhập lại liên tục khi sai mật khẩu/API key.
+_TOKEN = {"value": DB_AUTH, "exp": 0.0, "failed_at": 0.0}
+
+
+def _sign_in():
+    """Đăng nhập Firebase Auth (Email/Password) -> (idToken, hết hạn ở epoch)."""
+    if not (FIREBASE_API_KEY and FIREBASE_EMAIL and FIREBASE_PASSWORD):
+        return None
+    url = ("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key="
+           + FIREBASE_API_KEY)
+    body = {
+        "email": FIREBASE_EMAIL,
+        "password": FIREBASE_PASSWORD,
+        "returnSecureToken": True,
+    }
+    try:
+        data = _request("POST", url, body) or {}
+    except urllib.error.HTTPError as exc:
+        hint = ""
+        try:
+            err = json.loads(exc.read().decode("utf-8", "replace"))
+            hint = err.get("error", {}).get("message", "")
+        except Exception:
+            pass
+        print("[AI] Đăng nhập thất bại ({}): {}".format(exc.code, hint or exc.reason),
+              file=sys.stderr, flush=True)
+        return None
+    token = data.get("idToken")
+    if not token:
+        print("[AI] Đăng nhập không trả về idToken.", file=sys.stderr, flush=True)
+        return None
+    try:
+        ttl = float(data.get("expiresIn", 3600))
+    except (TypeError, ValueError):
+        ttl = 3600.0
+    print("[AI] Đã đăng nhập Firebase Auth với {}.".format(
+        data.get("email") or FIREBASE_EMAIL), flush=True)
+    return token, time.time() + ttl
+
+
+def _auth_token():
+    """Token đang dùng; tự đăng nhập lại khi hết hạn (không thử lại nếu vừa lỗi)."""
+    if _TOKEN["value"] and time.time() < float(_TOKEN["exp"]) - 60:
+        return _TOKEN["value"]
+    if _TOKEN["failed_at"] and time.time() - float(_TOKEN["failed_at"]) < 300:
+        return _TOKEN["value"]
+    signed = _sign_in()
+    if signed is None:
+        if FIREBASE_API_KEY or FIREBASE_EMAIL:
+            _TOKEN["failed_at"] = time.time()
+        return _TOKEN["value"]
+    _TOKEN["value"], _TOKEN["exp"] = signed
+    _TOKEN["failed_at"] = 0.0
+    return _TOKEN["value"]
+
+
 def _url(path, query=None):
     url = "{}/{}.json".format(DB_URL, path.strip("/"))
     parts = []
     if query:
         parts.append(query)
-    if DB_AUTH:
-        parts.append(urllib.parse.urlencode({"auth": DB_AUTH}))
+    token = _auth_token()
+    if token:
+        parts.append(urllib.parse.urlencode({"auth": token}))
     if parts:
         url += "?" + "&".join(parts)
     return url
@@ -219,9 +290,20 @@ def fetch_data(path, query=None):
 
 
 def push_data(path, data):
-    print("[AI] Đang ghi /{} ...".format(path))
-    _request("PUT", _url(path), data)
-    print("[AI] Đã ghi Firebase /{}".format(path))
+    print("[AI] Đang ghi /{} ...".format(path), flush=True)
+    try:
+        _request("PUT", _url(path), data)
+    except urllib.error.HTTPError as exc:
+        # Token hết hạn giữa phiên -> đăng nhập lại rồi thử đúng một lần
+        can_reauth = bool(FIREBASE_EMAIL or FIREBASE_PASSWORD or DB_AUTH)
+        if exc.code in (401, 403) and can_reauth and not _TOKEN["failed_at"]:
+            print("[AI] Bị từ chối ({}), đăng nhập lại và thử lại...".format(exc.code),
+                  flush=True)
+            _TOKEN["value"], _TOKEN["exp"] = "", 0.0
+            _request("PUT", _url(path), data)
+        else:
+            raise
+    print("[AI] Đã ghi Firebase /{}".format(path), flush=True)
 
 
 # ============================ ĐỌC DỮ LIỆU ============================
@@ -719,7 +801,26 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="AI phân tích hầm kín")
     parser.add_argument("--dry-run", action="store_true", help="không ghi Firebase, chỉ in JSON")
     parser.add_argument("--out", default=None, help="ghi kết quả ra file JSON")
+    parser.add_argument("--check-auth", action="store_true",
+                        help="chỉ kiểm tra đăng nhập Firebase rồi thoát")
     args = parser.parse_args(argv)
+
+    if args.check_auth:
+        missing = [name for name, val in (("FIREBASE_API_KEY", FIREBASE_API_KEY),
+                                          ("email (AI_EMAIL)", FIREBASE_EMAIL),
+                                          ("mật khẩu (AI_PASSWORD)", FIREBASE_PASSWORD))
+                   if not val]
+        if missing:
+            print("[AI] Thiếu: " + ", ".join(missing), file=sys.stderr, flush=True)
+            return 1
+        print("[AI] Kiểm tra đăng nhập với {} ...".format(FIREBASE_EMAIL), flush=True)
+        signed = _sign_in()
+        if not signed:
+            return 2
+        print("[AI] Đăng nhập OK. Rules phải cho email này ghi /predictions/latest.",
+              flush=True)
+        return 0
+
     try:
         payload = analyse(dry_run=args.dry_run, out_file=args.out)
     except urllib.error.HTTPError as exc:
@@ -730,15 +831,26 @@ def main(argv=None):
             pass
         if exc.code in (401, 403):
             print("[AI] Firebase từ chối quyền: HTTP {} {}".format(exc.code, exc.reason),
-                  file=sys.stderr)
-            print("[AI] Nghĩa là Rules đang chặn ghi /predictions/latest khi chưa đăng nhập.",
-                  file=sys.stderr)
-            print("[AI] Sửa: Firebase Console → Realtime Database → Rules, thêm dòng:", file=sys.stderr)
-            print('        "predictions": { ".read": true, ".write": true }', file=sys.stderr)
-            print("[AI] (hoặc đặt secret FIREBASE_DB_AUTH và bỏ comment trong forecast.yml)",
-                  file=sys.stderr)
+                  file=sys.stderr, flush=True)
+            if FIREBASE_API_KEY or FIREBASE_EMAIL:
+                print("[AI] Đã cấu hình tài khoản AI nhưng đăng nhập không thành công.",
+                      file=sys.stderr, flush=True)
+                print("[AI] Kiểm tra 3 secret: FIREBASE_API_KEY (Web API key), "
+                      "FIREBASE_EMAIL, FIREBASE_PASSWORD;", file=sys.stderr, flush=True)
+                print("[AI] và email đó phải trùng với email trong Firebase Rules.",
+                      file=sys.stderr, flush=True)
+            else:
+                print("[AI] Nghĩa là Rules đang chặn ghi /predictions/latest khi chưa đăng nhập.",
+                      file=sys.stderr, flush=True)
+                print("[AI] Sửa một trong hai cách:", file=sys.stderr, flush=True)
+                print("[AI]  a) đặt 3 secret FIREBASE_API_KEY / FIREBASE_EMAIL / "
+                      "FIREBASE_PASSWORD (khuyến nghị),", file=sys.stderr, flush=True)
+                print("[AI]  b) hoặc cho phép ghi công khai nhánh predictions:",
+                      file=sys.stderr, flush=True)
+                print('        "predictions": { ".write": true }', file=sys.stderr, flush=True)
         else:
-            print("[AI] Lỗi HTTP {}: {} {}".format(exc.code, exc.reason, body), file=sys.stderr)
+            print("[AI] Lỗi HTTP {}: {} {}".format(exc.code, exc.reason, body),
+                  file=sys.stderr, flush=True)
         return 2
     except urllib.error.URLError as exc:
         print("[AI] Lỗi mạng: {}".format(getattr(exc, "reason", exc)), file=sys.stderr)
