@@ -23,7 +23,7 @@
             --info-bg: #e0f2fe;
         }
 
-        * {
+- {
             box-sizing: border-box
         }
 
@@ -335,7 +335,7 @@
     </main>
 
     <script>
-        const DB = "https://giamsatkhidoc-5b8d0-default-rtdb.asia-southeast1.firebasedatabase.app";
+        const DB = "https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app";
 
         const METRICS = {
             t: { label: "Nhiệt độ (°C)", color: "#ef4444" },
@@ -367,23 +367,40 @@
             b.textContent = text || "";
         }
 
-      async function refreshLatest() {
-    try {
-        const d = await getJSON("/sensors.json");
-        if (!d) { setStatus("Chưa có dữ liệu trong /sensors", false); return; }
+        async function refreshLatest() {
+            try {
+                const d = await getJSON("/latest.json");
+                if (!d) { setStatus("Chưa có dữ liệu trong /latest", false); return; }
 
-        // Ánh xạ đúng tên biến từ Firebase của bạn
-        $("v-temp").textContent = fmt(d.temperature, 1);
-        $("v-hum").textContent  = fmt(d.humidity, 1);
-        $("v-dust").textContent = fmt(d.co2, 0); // Tạm hiển thị CO2 vào ô Bụi
-        $("v-mq2").textContent  = fmt(d.gas, 0); // Hiển thị Gas vào ô Khói
+                $("v-temp").textContent = fmt(d.temp, 1);
+                $("v-hum").textContent = fmt(d.hum, 1);
+                $("v-dust").textContent = fmt(d.dust, 0);
+                $("v-mq2").textContent = fmt(d.mq2, 0);
+                $("n-temp").textContent = d.modbusOk === false ? "mất kết nối RS485" : "";
+                $("n-hum").textContent = d.modbusOk === false ? "mất kết nối RS485" : "";
+                $("n-dust").textContent = d.noiseDust ? "tín hiệu nhiễu" : "";
+                $("n-mq2").textContent = d.noiseMq2 ? "tín hiệu nhiễu" : (d.warmup ? "đang làm nóng" : "");
 
-        setStatus("Đã kết nối Firebase (Cập nhật: " + (d.time || "vừa xong") + ")", true);
-        setBanner("", "");
-    } catch (e) {
-        setStatus("Lỗi kết nối: " + e.message, false);
-    }
-}
+                const age = Date.now() - d.ts;
+                const t = new Date(d.ts).toLocaleTimeString("vi-VN");
+                if (age > STALE_MS) {
+                    setStatus("Thiết bị ngoại tuyến, lần cuối " + t, false);
+                    setBanner("warn", "Không nhận được dữ liệu mới từ thiết bị.");
+                } else {
+                    setStatus("Cập nhật lúc " + t, true);
+                    if (d.alarm) {
+                        const what = [d.smoke ? "khói" : null, d.dustAlarm ? "bụi" : null].filter(Boolean).join(" và ");
+                        setBanner("bad", "CẢNH BÁO: phát hiện " + what + " vượt ngưỡng");
+                    } else if (d.warmup) {
+                        setBanner("info", "MQ-2 đang làm nóng, cảnh báo khói tạm tắt.");
+                    } else {
+                        setBanner("", "");
+                    }
+                }
+            } catch (e) {
+                setStatus("Lỗi kết nối: " + e.message, false);
+            }
+        }
 
         let pred = null, lastLabels = [], lastData = [];
 
