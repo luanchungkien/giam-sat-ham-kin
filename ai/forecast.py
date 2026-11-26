@@ -1,863 +1,826 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""AI phân tích & dự báo cho hệ thống GIÁM SÁT HẦM KÍN.
-
-Đọc  /latest  và  /history  từ Firebase Realtime Database,
-tính toán ngưỡng + xu hướng + dự báo + bất thường, rồi ghi kết quả
-vào /predictions/latest  (đúng schema mà index.html đọc).
-
-Chạy:
-    python forecast.py                # đọc + ghi Firebase
-    python forecast.py --dry-run      # chỉ đọc, in JSON ra stdout
-    python forecast.py --out kq.json  # ghi thêm ra file (tiện debug)
-
-Biến môi trường:
-    FIREBASE_DB_URL     URL Realtime Database
-    FIREBASE_DB_AUTH    token dán sẵn (nối vào ?auth=) — tuỳ chọn
-    FIREBASE_API_KEY    Web API key của project (để đăng nhập)
-    FIREBASE_EMAIL      tài khoản Firebase Auth mà Rules cho phép ghi (vd ai@gmail.com)
-    FIREBASE_PASSWORD   mật khẩu tài khoản đó
-                        (chấp nhận cả tên AI_EMAIL / AI_PASSWORD)
-                        -> nếu có đủ 3 biến này, script tự đăng nhập lấy idToken
-    AI_OUTPUT_PATH      mặc định "predictions/latest"
-    AI_LOOKBACK_HOURS   mặc định 24
-    ENABLE_WEATHER      "0" để tắt gọi Open-Meteo
-    SITE_LAT / SITE_LON / SITE_NAME / SITE_TZ  trạm so sánh thời tiết (mặc định Thái Nguyên)
-    AI_BIAS_DECAY_MIN   hằng số tắt dần khi neo dự báo vào giá trị hiện tại (phút)
-    AI_REVERT_MIN       hằng số hồi quy về mức nền 24 giờ (phút), mặc định 360
-
-Mô hình dự báo:
-    6 mốc cách nhau 2 giờ, xa nhất 12 giờ. Dùng hồi quy về trung vị 24 giờ
-    (damped mean reversion) thay cho ngoại suy tuyến tính/ARIMA, vì ở tầm 12 giờ
-    hai mô hình kia cho ra đường phẳng (mọi mốc trùng nhau) hoặc số vô lý.
-
-Phụ thuộc:
-    bắt buộc : numpy
-    tuỳ chọn : scikit-learn (IsolationForest) -> thiếu thì dùng z-score.
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
-import math
-import os
-import sys
-import time
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
-
-import numpy as np
-
-try:  # phát hiện bất thường đa chiều (tuỳ chọn — thiếu thì dùng z-score)
-    from sklearn.ensemble import IsolationForest
-    from sklearn.preprocessing import StandardScaler
-except Exception:  # pragma: no cover - môi trường không có sklearn
-    IsolationForest = None
-    StandardScaler = None
-
-
-# ============================ CẤU HÌNH ============================
-
-DB_URL = os.environ.get(
-    "FIREBASE_DB_URL",
-    "https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app",
-).rstrip("/")
-DB_AUTH = os.environ.get("FIREBASE_DB_AUTH", "").strip()
-# Đăng nhập bằng tài khoản Email/Password (khuyến nghị, khớp Firebase Rules
-# kiểu: "predictions": { ".write": "auth.token.email == 'ai@gmail.com'" })
-# Nhận cả hai cách đặt tên: FIREBASE_EMAIL/FIREBASE_PASSWORD hoặc AI_EMAIL/AI_PASSWORD.
-FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", "").strip()
-FIREBASE_EMAIL = (os.environ.get("FIREBASE_EMAIL")
-                  or os.environ.get("AI_EMAIL") or "").strip()
-FIREBASE_PASSWORD = (os.environ.get("FIREBASE_PASSWORD")
-                     or os.environ.get("AI_PASSWORD") or "").strip()
-OUTPUT_PATH = os.environ.get("AI_OUTPUT_PATH", "predictions/latest").strip("/")
-LOOKBACK_HOURS = float(os.environ.get("AI_LOOKBACK_HOURS", "24"))
-WEATHER_ENABLED = os.environ.get("ENABLE_WEATHER", "1") not in ("0", "false", "False", "")
-# Trạm so sánh: Thái Nguyên (đổi bằng biến môi trường nếu cần)
-SITE_NAME = os.environ.get("SITE_NAME", "Thái Nguyên")
-SITE_TZ = os.environ.get("SITE_TZ", "Asia/Ho_Chi_Minh")
-SITE_LAT = os.environ.get("SITE_LAT", "21.5942")
-SITE_LON = os.environ.get("SITE_LON", "105.8481")
-TIMEOUT = float(os.environ.get("AI_HTTP_TIMEOUT", "10"))
-STALE_SEC = float(os.environ.get("AI_STALE_SEC", "180"))
-# Dự báo được "neo" vào giá trị cảm biến hiện tại rồi tắt dần sai lệch,
-# để điểm +1h không nhảy cóc so với số đang hiển thị (đơn vị: phút).
-BIAS_DECAY_MIN = float(os.environ.get("AI_BIAS_DECAY_MIN", "120"))
-
-SCHEMA_VERSION = 2
-
-# Các mốc dự báo (phút kể từ điểm dữ liệu cuối cùng): cách nhau 2 giờ, xa nhất 12 giờ
-HORIZONS = (120, 240, 360, 480, 600, 720)
-BIN_MINUTES = HORIZONS[0]          # bước giữa hai cột (phút)
-HORIZON_HOURS = HORIZONS[-1] // 60  # mốc xa nhất, dùng cho câu tóm tắt
-
-# Ngưỡng mặc định. PHẢI KHỚP với ngưỡng trong firmware:
-#   DUST_WARN_UG = 500  -> dust warn 500 / danger 800
-#   MQ2_WARN_MV  = 1800 -> mq2  warn 1800 / danger 2500
-# Có thể ghi đè mà không cần sửa code: /config/thresholds trên Firebase
-#   { "temp": {"warn": 40, "danger": 50}, ... }
-METRICS = {
-    "temp": {
-        "label": "Nhiệt độ",
-        "unit": "°C",
-        "dec": 1,
-        "warn": 40.0,
-        "danger": 50.0,
-        "lo": -10.0,
-        "hi": 120.0,
-        "rate": 3.0,  # °C/giờ - chặn trên của tốc độ thay đổi khi dự báo
-        "minSamples": 60,
-    },
-    "hum": {
-        "label": "Độ ẩm",
-        "unit": "%RH",
-        "dec": 1,
-        "warn": 80.0,
-        "danger": 90.0,
-        "lo": 0.0,
-        "hi": 100.0,
-        "rate": 10.0,  # %RH/giờ
-        "minSamples": 60,
-    },
-    "dust": {
-        "label": "Bụi",
-        "unit": "µg/m³",
-        "dec": 0,
-        "warn": 500.0,
-        "danger": 800.0,
-        "lo": 0.0,
-        "hi": 2000.0,
-        "rate": 150.0,  # µg/m³/giờ
-        "minSamples": 60,
-    },
-    "mq2": {
-        "label": "Khói (MQ-2)",
-        "unit": "mV",
-        "dec": 0,
-        "warn": 1800.0,
-        "danger": 2500.0,
-        "lo": 0.0,
-        "hi": 5000.0,
-        "rate": 400.0,  # mV/giờ
-        "minSamples": 60,
-    },
-}
-ORDER = ("temp", "hum", "dust", "mq2")
-
-# Tên field cũ (firmware <= 1.0.1 ghi history bằng "t"/"h") -> vẫn đọc được
-FIELD_ALIAS = {
-    "temp": ("temp", "t"),
-    "hum": ("hum", "h"),
-    "dust": ("dust",),
-    "mq2": ("mq2",),
-}
-
-LEVEL_TEXT = {0: "BÌNH THƯỜNG", 1: "CẢNH BÁO", 2: "NGUY HIỂM"}
-
-
-def _force_utf8_console():
-    """Windows mặc định dùng cp1252 -> in tiếng Việt sẽ crash; ép UTF-8."""
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
-
-_force_utf8_console()
-
-
-
-# ============================ TIỆN ÍCH ============================
-
-
-def _num(value):
-    """Ép về float hữu hạn, sai/None -> None (Firebase hay trả null)."""
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    return f if math.isfinite(f) else None
-
-
-def _pick(record, metric):
-    for key in FIELD_ALIAS[metric]:
-        if key in record:
-            value = _num(record[key])
-            if value is not None:
-                return value
-    return None
-
-
-def _r(value, dec):
-    return None if value is None else round(float(value), dec)
-
-
-# Token hiện tại: ưu tiên FIREBASE_DB_AUTH (dán sẵn), nếu không có thì đăng nhập.
-# "failed_at" để không thử đăng nhập lại liên tục khi sai mật khẩu/API key.
-_TOKEN = {"value": DB_AUTH, "exp": 0.0, "failed_at": 0.0}
-
-
-def _sign_in():
-    """Đăng nhập Firebase Auth (Email/Password) -> (idToken, hết hạn ở epoch)."""
-    if not (FIREBASE_API_KEY and FIREBASE_EMAIL and FIREBASE_PASSWORD):
-        return None
-    url = ("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key="
-           + FIREBASE_API_KEY)
-    body = {
-        "email": FIREBASE_EMAIL,
-        "password": FIREBASE_PASSWORD,
-        "returnSecureToken": True,
-    }
-    try:
-        data = _request("POST", url, body) or {}
-    except urllib.error.HTTPError as exc:
-        hint = ""
-        try:
-            err = json.loads(exc.read().decode("utf-8", "replace"))
-            hint = err.get("error", {}).get("message", "")
-        except Exception:
-            pass
-        print("[AI] Đăng nhập thất bại ({}): {}".format(exc.code, hint or exc.reason),
-              file=sys.stderr, flush=True)
-        return None
-    token = data.get("idToken")
-    if not token:
-        print("[AI] Đăng nhập không trả về idToken.", file=sys.stderr, flush=True)
-        return None
-    try:
-        ttl = float(data.get("expiresIn", 3600))
-    except (TypeError, ValueError):
-        ttl = 3600.0
-    print("[AI] Đã đăng nhập Firebase Auth với {}.".format(
-        data.get("email") or FIREBASE_EMAIL), flush=True)
-    return token, time.time() + ttl
-
-
-def _auth_token():
-    """Token đang dùng; tự đăng nhập lại khi hết hạn (không thử lại nếu vừa lỗi)."""
-    if _TOKEN["value"] and time.time() < float(_TOKEN["exp"]) - 60:
-        return _TOKEN["value"]
-    if _TOKEN["failed_at"] and time.time() - float(_TOKEN["failed_at"]) < 300:
-        return _TOKEN["value"]
-    signed = _sign_in()
-    if signed is None:
-        if FIREBASE_API_KEY or FIREBASE_EMAIL:
-            _TOKEN["failed_at"] = time.time()
-        return _TOKEN["value"]
-    _TOKEN["value"], _TOKEN["exp"] = signed
-    _TOKEN["failed_at"] = 0.0
-    return _TOKEN["value"]
-
-
-def _url(path, query=None):
-    url = "{}/{}.json".format(DB_URL, path.strip("/"))
-    parts = []
-    if query:
-        parts.append(query)
-    token = _auth_token()
-    if token:
-        parts.append(urllib.parse.urlencode({"auth": token}))
-    if parts:
-        url += "?" + "&".join(parts)
-    return url
-
-
-def _request(method, url, payload=None):
-    body = None
-    headers = {"Accept": "application/json", "User-Agent": "giam-sat-ham-kin-ai/2"}
-    if payload is not None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json; charset=utf-8"
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        raw = resp.read().decode("utf-8")
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-
-
-def fetch_data(path, query=None):
-    return _request("GET", _url(path, query))
-
-
-def push_data(path, data):
-    print("[AI] Đang ghi /{} ...".format(path), flush=True)
-    try:
-        _request("PUT", _url(path), data)
-    except urllib.error.HTTPError as exc:
-        # Token hết hạn giữa phiên -> đăng nhập lại rồi thử đúng một lần
-        can_reauth = bool(FIREBASE_EMAIL or FIREBASE_PASSWORD or DB_AUTH)
-        if exc.code in (401, 403) and can_reauth and not _TOKEN["failed_at"]:
-            print("[AI] Bị từ chối ({}), đăng nhập lại và thử lại...".format(exc.code),
-                  flush=True)
-            _TOKEN["value"], _TOKEN["exp"] = "", 0.0
-            _request("PUT", _url(path), data)
-        else:
-            raise
-    print("[AI] Đã ghi Firebase /{}".format(path), flush=True)
-
-
-# ============================ ĐỌC DỮ LIỆU ============================
-
-
-def load_latest():
-    data = fetch_data("latest")
-    return data if isinstance(data, dict) else {}
-
-
-def load_history(lookback_hours=LOOKBACK_HOURS):
-    """Trả về list [{ts, temp, hum, dust, mq2}] đã sắp xếp theo thời gian."""
-    since = int(time.time() - lookback_hours * 3600)
-    query = urllib.parse.urlencode({"orderBy": '"$key"', "startAt": '"{}"'.format(since)})
-    raw = fetch_data("history", query)
-    records = []
-    if isinstance(raw, dict):
-        for key, item in raw.items():
-            if not isinstance(item, dict):
-                continue
-            try:
-                ts = int(float(key))
-            except (TypeError, ValueError):
-                continue
-            rec = {"ts": ts}
-            for metric in ORDER:
-                rec[metric] = _pick(item, metric)
-            records.append(rec)
-    records.sort(key=lambda r: r["ts"])
-    return records
-
-
-def load_thresholds():
-    """Ngưỡng mặc định + cho phép ghi đè từ /config/thresholds."""
-    custom = {}
-    try:
-        raw = fetch_data("config/thresholds")
-        if isinstance(raw, dict):
-            custom = raw
-    except Exception as exc:  # không có config thì bỏ qua
-        print("[AI] Không đọc được /config/thresholds: {}".format(exc))
-
-    thresholds = {}
-    for metric in ORDER:
-        spec = METRICS[metric]
-        warn = spec["warn"]
-        danger = spec["danger"]
-        source = "firmware"
-        entry = custom.get(metric) if isinstance(custom.get(metric), dict) else {}
-        cw, cd = _num(entry.get("warn")), _num(entry.get("danger"))
-        if cw is not None:
-            warn = cw
-            source = "config"
-        if cd is not None:
-            danger = cd
-            source = "config"
-        if danger <= warn:
-            danger = warn * 1.25
-        thresholds[metric] = {"warn": float(warn), "danger": float(danger), "source": source}
-    return thresholds
-
-
-# ============================ THỐNG KÊ ============================
-
-
-def series_of(records, metric):
-    return [(r["ts"], r[metric]) for r in records if r.get(metric) is not None]
-
-
-def describe(values):
-    arr = np.asarray(values, dtype=float)
-    std = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
-    return {
-        "n": int(arr.size),
-        "mean": float(np.mean(arr)),
-        "std": std,
-        "min": float(np.min(arr)),
-        "max": float(np.max(arr)),
-        "p90": float(np.percentile(arr, 90)),
-        "p99": float(np.percentile(arr, 99)),
-    }
-
-
-def zscore_of(value, stats):
-    if value is None or stats is None or stats["std"] <= 1e-9:
-        return None
-    return (value - stats["mean"]) / stats["std"]
-
-
-def trend_per_hour(series, window_min=60.0):
-    """Độ dốc hồi quy tuyến tính trên `window_min` phút cuối, đơn vị /giờ."""
-    if len(series) < 5:
-        return None
-    end_ts = series[-1][0]
-    pts = [(t, v) for t, v in series if t >= end_ts - window_min * 60]
-    if len(pts) < 5:
-        return None
-    x = np.array([t for t, _ in pts], dtype=float)
-    y = np.array([v for _, v in pts], dtype=float)
-    x = (x - x[0]) / 3600.0
-    if float(np.ptp(x)) <= 0:
-        return None
-    slope = float(np.polyfit(x, y, 1)[0])
-    return slope
-
-
-# ============================ DỰ BÁO ============================
-
-REVERT_MIN = float(os.environ.get("AI_REVERT_MIN", "360"))
-
-
-def _revert_forecast(values, horizons):
-    """Hồi quy về mức nền 24 giờ (damped mean reversion).
-
-    Với tầm dự báo 2–12 giờ, cả ngoại suy tuyến tính lẫn ARIMA(1,1,1) đều cho
-    ra đường gần như phẳng (mọi mốc trùng nhau) hoặc văng ra số vô lý khi chuỗi
-    có cú nhảy. Mô hình ở đây: xuất phát từ mẫu cuối rồi tiến dần về trung vị
-    24 giờ theo hàm mũ — nên mỗi mốc một khác, và không bao giờ ra ngoài dải
-    đã từng đo.
-    """
-    last = float(values[-1])
-    base = float(np.percentile(values, 50))
-    return [base + (last - base) * math.exp(-h / REVERT_MIN) for h in horizons]
-
-
-def forecast_metric(series, metric, horizons=HORIZONS, anchor=None):
-    """Trả về (list giá trị dự báo cùng độ dài horizons, phương pháp).
-
-    `anchor`: giá trị cảm biến hiện tại. Dự báo được neo vào giá trị này rồi
-    tắt dần sai lệch (BIAS_DECAY_MIN), nhờ vậy mốc +2h không nhảy cóc so với
-    số đang hiển thị trên dashboard.
-    """
-    spec = METRICS[metric]
-    if len(series) < spec["minSamples"]:
-        return None, "insufficient"
-
-    values = np.array([v for _, v in series], dtype=float)
-    raw = _revert_forecast(values, horizons)
-    method = "mean-revert"
-
-    # Neo vào giá trị hiện tại: lệch giữa "mẫu cuối của chuỗi" và "cảm biến bây giờ"
-    # được cộng vào dự báo rồi tắt dần, để đường dự báo nối liền với số đang hiển thị.
-    last = float(values[-1])
-    offset = 0.0 if anchor is None else float(anchor) - last
-    reference = last + offset                      # = anchor nếu có
-    corrected = [
-        value + offset * math.exp(-horizon / BIAS_DECAY_MIN)
-        for horizon, value in zip(horizons, raw)
-    ]
-
-    # Kẹp tốc độ biến thiên: mỗi giờ không đổi quá `rate`
-    limited = []
-    for horizon, value in zip(horizons, corrected):
-        span = spec["rate"] * horizon / 60.0
-        limited.append(max(reference - span, min(reference + span, value)))
-
-    # Kẹp vào DẢI ĐÃ QUAN SÁT trong 24h (p2..p98, mở rộng để chứa giá trị hiện tại)
-    lo_obs = min(float(np.percentile(values, 2)), reference)
-    hi_obs = max(float(np.percentile(values, 98)), reference)
-    limited = [max(lo_obs, min(hi_obs, v)) for v in limited]
-
-    # Kẹp về khoảng vật lý của cảm biến
-    cleaned = [
-        _r(max(spec["lo"], min(spec["hi"], v)), spec["dec"]) for v in limited
-    ]
-    return cleaned, method
-
-
-# ============================ BẤT THƯỜNG ============================
-
-
-def detect_anomaly(records, current):
-    rows = []
-    for rec in records:
-        row = [rec.get(m) for m in ORDER]
-        if all(v is not None for v in row):
-            rows.append(row)
-
-    result = {
-        "isAnomaly": None,
-        "method": "none",
-        "score": None,
-        "samples": len(rows),
-        "reason": "",
-    }
-    if len(rows) < 30:
-        result["reason"] = "chưa đủ 30 mẫu đủ 4 chỉ số"
-        return result
-
-    if any(current.get(m) is None for m in ORDER):
-        result["reason"] = "thiếu chỉ số hiện tại"
-        return result
-
-    matrix = np.asarray(rows, dtype=float)
-    vec = np.asarray([current[m] for m in ORDER], dtype=float)
-
-    if IsolationForest is not None and StandardScaler is not None:
-        try:
-            scaler = StandardScaler().fit(matrix)
-            model = IsolationForest(
-                n_estimators=200, contamination=0.02, random_state=42
-            ).fit(scaler.transform(matrix))
-            scaled = scaler.transform([vec])
-            result["isAnomaly"] = bool(int(model.predict(scaled)[0]) == -1)
-            result["score"] = round(float(model.decision_function(scaled)[0]), 4)
-            result["method"] = "isolation_forest"
-            return result
-        except Exception as exc:
-            print("[AI] IsolationForest lỗi: {}".format(exc))
-
-    mu = matrix.mean(axis=0)
-    sd = matrix.std(axis=0, ddof=1)
-    sd[sd <= 1e-9] = 1.0
-    z = np.abs((vec - mu) / sd)
-    result["isAnomaly"] = bool(float(z.max()) >= 4.0)
-    result["score"] = round(float(z.max()), 2)
-    result["method"] = "zscore"
-    return result
-
-
-# ============================ THỜI TIẾT ============================
-
-
-def fetch_weather():
-    ctx = {
-        "ok": False,
-        "city": SITE_NAME,
-        "lat": _num(SITE_LAT),
-        "lon": _num(SITE_LON),
-        "tz": SITE_TZ,
-        "cityTemp": None,
-        "cityHum": None,
-        "cityPm25": None,
-        "cityPm25Forecast6h": None,
-    }
-    if not WEATHER_ENABLED:
-        return ctx
-
-    try:
-        url = (
-            "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}"
-            "&current=temperature_2m,relative_humidity_2m&timezone={}".format(
-                SITE_LAT, SITE_LON, urllib.parse.quote(SITE_TZ)
-            )
-        )
-        data = _request("GET", url) or {}
-        current = data.get("current") or {}
-        ctx["cityTemp"] = _num(current.get("temperature_2m"))
-        ctx["cityHum"] = _num(current.get("relative_humidity_2m"))
-        ctx["ok"] = ctx["cityTemp"] is not None
-    except Exception as exc:
-        print("[AI] Lỗi lấy thời tiết: {}".format(exc))
-
-    try:
-        # Dùng UTC cho cả 2 phía để khỏi lệch múi giờ giữa runner và trạm
-        url = (
-            "https://air-quality-api.open-meteo.com/v1/air-quality?latitude={}&longitude={}"
-            "&current=pm2_5&hourly=pm2_5&timezone=UTC&forecast_days=1".format(SITE_LAT, SITE_LON)
-        )
-        data = _request("GET", url) or {}
-        ctx["cityPm25"] = _num((data.get("current") or {}).get("pm2_5"))
-        hourly = data.get("hourly") or {}
-        times = hourly.get("time") or []
-        pm25 = hourly.get("pm2_5") or []
-        now_hour = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:00")
-        if now_hour in times:
-            idx = times.index(now_hour)
-            if ctx["cityPm25"] is None and idx < len(pm25):
-                ctx["cityPm25"] = _num(pm25[idx])
-            if idx + 6 < len(pm25):
-                ctx["cityPm25Forecast6h"] = _num(pm25[idx + 6])
-        ctx["ok"] = ctx["ok"] or ctx["cityPm25"] is not None
-    except Exception as exc:
-        print("[AI] Lỗi lấy chất lượng không khí: {}".format(exc))
-
-    return ctx
-
-
-# ============================ ĐÁNH GIÁ ============================
-
-
-def evaluate(records, latest, current, anomaly, thresholds):
-    reasons = []
-    level = 0
-    flagged = []
-
-    for metric in ORDER:
-        spec = METRICS[metric]
-        value = current.get(metric)
-        th = thresholds[metric]
-        if value is None:
-            continue
-        text = "{value:.{dec}f}{unit}".format(
-            value=value, dec=spec["dec"], unit=spec["unit"]
-        )
-        if value >= th["danger"]:
-            level = 2
-            flagged.append(metric)
-            reasons.append(
-                "{} {} vượt ngưỡng nguy hiểm ({:g}{})".format(
-                    spec["label"], text, th["danger"], spec["unit"]
-                )
-            )
-        elif value >= th["warn"]:
-            level = max(level, 1)
-            flagged.append(metric)
-            reasons.append(
-                "{} {} vượt ngưỡng cảnh báo ({:g}{})".format(
-                    spec["label"], text, th["warn"], spec["unit"]
-                )
-            )
-
-    # Lệch so với phân bố 24h (không thay thế ngưỡng tuyệt đối)
-    for metric in ORDER:
-        value = current.get(metric)
-        series = series_of(records, metric)
-        if value is None or len(series) < 60:
-            continue
-        stats = describe([v for _, v in series])
-        z = zscore_of(value, stats)
-        if z is not None and z >= 3.0 and metric not in flagged:
-            level = max(level, 1)
-            reasons.append(
-                "{} cao hơn mức thường ngày {:.1f}σ".format(METRICS[metric]["label"], z)
-            )
-
-    if latest.get("alarm") is True:
-        level = 2
-        what = []
-        if latest.get("smoke"):
-            what.append("khói")
-        if latest.get("dustAlarm"):
-            what.append("bụi")
-        reasons.append(
-            "Thiết bị báo động: {}".format(" và ".join(what) if what else "vượt ngưỡng")
-        )
-
-    if latest.get("modbusOk") is False:
-        level = max(level, 1)
-        reasons.append("Mất kết nối RS485 với cảm biến nhiệt độ/độ ẩm")
-
-    if anomaly.get("isAnomaly") is True:
-        level = max(level, 1)
-        reasons.append("Bất thường đa chiều: tổ hợp 4 chỉ số lệch khỏi mức thường ngày")
-
-    if latest.get("warmup") is True:
-        reasons.append("MQ-2 đang làm nóng, cảnh báo khói tạm tắt")
-
-    if latest.get("noiseDust") is True:
-        reasons.append("Tín hiệu bụi nhiễu, kết quả có thể sai lệch")
-
-    return level, reasons
-
-
-def build_summary(level, trends, forecasts):
-    if level == 2:
-        head = "Phát hiện tình trạng nguy hiểm trong hầm."
-    elif level == 1:
-        head = "Có chỉ số cần chú ý."
-    else:
-        head = "Tất cả các chỉ số trong ngưỡng an toàn."
-
-    parts = [head]
-    for metric in ("temp", "dust"):
-        values = forecasts.get(metric) or []
-        if len(values) < 2 or values[0] is None or values[-1] is None:
-            continue
-        spec = METRICS[metric]
-        first, last = float(values[0]), float(values[-1])
-        # Nói theo đúng đường dự báo (mốc đầu -> mốc cuối), không dùng độ dốc 1 giờ
-        # để tránh câu "dự báo giảm" trong khi đường dự báo lại đi lên.
-        scale = max(0.5, abs(first) * 0.03)
-        if abs(last - first) < scale:
-            word = "ổn định"
-        else:
-            word = "tăng" if last > first else "giảm"
-        parts.append(
-            "{} dự báo {} ({:.1f} → {:.1f}{} sau {} giờ).".format(
-                spec["label"],
-                word,
-                first,
-                last,
-                spec["unit"],
-                HORIZON_HOURS,
-            )
-        )
-    return " ".join(parts)
-
-
-# ============================ PIPELINE ============================
-
-
-def analyse(dry_run=False, out_file=None):
-    started = int(time.time())
-    print("[AI] Bắt đầu phân tích (lookback {}h)".format(LOOKBACK_HOURS))
-
-    latest = load_latest()
-    if not latest:
-        print("[AI] Không có /latest — bỏ qua lần chạy này.")
-        return None
-
-    records = load_history()
-    thresholds = load_thresholds()
-
-    current = {metric: _pick(latest, metric) for metric in ORDER}
-    current_ts = None
-    ts_raw = _num(latest.get("ts"))
-    if ts_raw is not None:
-        current_ts = ts_raw / 1000.0 if ts_raw > 1e11 else ts_raw  # Firestore trả ms
-    age_sec = None if current_ts is None else max(0.0, time.time() - current_ts)
-
-    forecasts = {}
-    methods = {}
-    trends = {}
-    ready = {}
-    for metric in ORDER:
-        series = series_of(records, metric)
-        values, method = forecast_metric(series, metric, anchor=current.get(metric))
-        forecasts[metric] = values
-        methods[metric] = method
-        ready[metric] = values is not None
-        trends[metric] = _r(trend_per_hour(series), 2) if series else None
-
-    anomaly = detect_anomaly(records, current)
-    weather = fetch_weather()
-    level, reasons = evaluate(records, latest, current, anomaly, thresholds)
-    summary = build_summary(level, trends, forecasts)
-
-    # baseTs: mốc thời gian của điểm history cuối (để chart nối liền dự báo)
-    base_ts = records[-1]["ts"] if records else int(current_ts or started)
-    span_hours = 0.0
-    if len(records) >= 2:
-        span_hours = round((records[-1]["ts"] - records[0]["ts"]) / 3600.0, 2)
-
-    payload = {
-        "status": "ok" if records else "no-history",
-        "schema": SCHEMA_VERSION,
-        "generatedAt": started * 1000,
-        "timestamp": started,
-        "baseTs": int(base_ts),
-        "binMinutes": BIN_MINUTES,
-        "horizons": list(HORIZONS),
-        "risk": {
-            "level": level,
-            "text": LEVEL_TEXT.get(level, "KHÔNG RÕ"),
-            "reasons": reasons,
-        },
-        "summary": summary,
-        "current": {m: _r(current[m], METRICS[m]["dec"]) for m in ORDER},
-        "forecast": forecasts,
-        "forecastMethod": methods,
-        "trend": trends,
-        "thresholds": thresholds,
-        "anomaly": anomaly,
-        "quality": {
-            "samples": len(records),
-            "coverageHours": span_hours,
-            "ageSec": None if age_sec is None else round(age_sec, 1),
-            "stale": bool(age_sec is not None and age_sec > STALE_SEC),
-            "forecastReady": ready,
-        },
-        "device": {
-            "fw": latest.get("fw"),
-            "rssi": latest.get("rssi"),
-            "uptime": latest.get("uptime"),
-            "modbusOk": latest.get("modbusOk"),
-            "alarm": latest.get("alarm"),
-            "warmup": latest.get("warmup"),
-        },
-        "external": weather,
-    }
-
-    if out_file:
-        with open(out_file, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-        print("[AI] Đã ghi {}".format(out_file))
-
-    if dry_run:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        push_data(OUTPUT_PATH, payload)
-
-    print(
-        "[AI] Xong: level={} ({}), mẫu={}, dự báo={}".format(
-            level,
-            LEVEL_TEXT.get(level),
-            len(records),
-            "có" if any(ready.values()) else "không",
-        )
-    )
-    return payload
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="AI phân tích hầm kín")
-    parser.add_argument("--dry-run", action="store_true", help="không ghi Firebase, chỉ in JSON")
-    parser.add_argument("--out", default=None, help="ghi kết quả ra file JSON")
-    parser.add_argument("--check-auth", action="store_true",
-                        help="chỉ kiểm tra đăng nhập Firebase rồi thoát")
-    args = parser.parse_args(argv)
-
-    if args.check_auth:
-        missing = [name for name, val in (("FIREBASE_API_KEY", FIREBASE_API_KEY),
-                                          ("email (AI_EMAIL)", FIREBASE_EMAIL),
-                                          ("mật khẩu (AI_PASSWORD)", FIREBASE_PASSWORD))
-                   if not val]
-        if missing:
-            print("[AI] Thiếu: " + ", ".join(missing), file=sys.stderr, flush=True)
-            return 1
-        print("[AI] Kiểm tra đăng nhập với {} ...".format(FIREBASE_EMAIL), flush=True)
-        signed = _sign_in()
-        if not signed:
-            return 2
-        print("[AI] Đăng nhập OK. Rules phải cho email này ghi /predictions/latest.",
-              flush=True)
-        return 0
-
-    try:
-        payload = analyse(dry_run=args.dry_run, out_file=args.out)
-    except urllib.error.HTTPError as exc:
-        body = ""
-        try:
-            body = exc.read().decode("utf-8", "replace")[:300]
-        except Exception:
-            pass
-        if exc.code in (401, 403):
-            print("[AI] Firebase từ chối quyền: HTTP {} {}".format(exc.code, exc.reason),
-                  file=sys.stderr, flush=True)
-            if FIREBASE_API_KEY or FIREBASE_EMAIL:
-                print("[AI] Đã cấu hình tài khoản AI nhưng đăng nhập không thành công.",
-                      file=sys.stderr, flush=True)
-                print("[AI] Kiểm tra 3 secret: FIREBASE_API_KEY (Web API key), "
-                      "FIREBASE_EMAIL, FIREBASE_PASSWORD;", file=sys.stderr, flush=True)
-                print("[AI] và email đó phải trùng với email trong Firebase Rules.",
-                      file=sys.stderr, flush=True)
-            else:
-                print("[AI] Nghĩa là Rules đang chặn ghi /predictions/latest khi chưa đăng nhập.",
-                      file=sys.stderr, flush=True)
-                print("[AI] Sửa một trong hai cách:", file=sys.stderr, flush=True)
-                print("[AI]  a) đặt 3 secret FIREBASE_API_KEY / FIREBASE_EMAIL / "
-                      "FIREBASE_PASSWORD (khuyến nghị),", file=sys.stderr, flush=True)
-                print("[AI]  b) hoặc cho phép ghi công khai nhánh predictions:",
-                      file=sys.stderr, flush=True)
-                print('        "predictions": { ".write": true }', file=sys.stderr, flush=True)
-        else:
-            print("[AI] Lỗi HTTP {}: {} {}".format(exc.code, exc.reason, body),
-                  file=sys.stderr, flush=True)
-        return 2
-    except urllib.error.URLError as exc:
-        print("[AI] Lỗi mạng: {}".format(getattr(exc, "reason", exc)), file=sys.stderr)
-        print("[AI] Kiểm tra FIREBASE_DB_URL và kết nối của runner.", file=sys.stderr)
-        return 2
-    return 0 if payload is not None else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Giám sát hầm kín</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #ffffff;
+            --card: #ffffff;
+            --text: #1c1f24;
+            --muted: #6b7280;
+            --line: #e5e7eb;
+            --ok: #0f766e;
+            --warn: #b45309;
+            --bad: #b91c1c;
+            --accent: #2563eb;
+            --bad-bg: #fee2e2;
+            --warn-bg: #fef3c7;
+            --info-bg: #e0f2fe;
+        }
+
+        * {
+            box-sizing: border-box
+        }
+
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+            line-height: 1.4
+        }
+
+        main {
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 16px
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 12px
+        }
+
+        h1 {
+            font-size: 20px;
+            margin: 0
+        }
+
+        #status {
+            font-size: 13px;
+            color: var(--muted)
+        }
+
+        #status.off {
+            color: var(--bad)
+        }
+
+        #banner {
+            display: none;
+            padding: 10px 14px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            font-weight: 600
+        }
+
+        #banner.bad {
+            display: block;
+            background: var(--bad-bg);
+            color: var(--bad)
+        }
+
+        #banner.warn {
+            display: block;
+            background: var(--warn-bg);
+            color: var(--warn)
+        }
+
+        #banner.info {
+            display: block;
+            background: var(--info-bg);
+            color: var(--accent)
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 12px;
+            margin-bottom: 12px
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 14px
+        }
+
+        .label {
+            font-size: 13px;
+            color: var(--muted)
+        }
+
+        .value {
+            font-size: 30px;
+            font-weight: 700;
+            margin-top: 4px
+        }
+
+        .unit {
+            font-size: 14px;
+            font-weight: 400;
+            color: var(--muted);
+            margin-left: 4px
+        }
+
+        .note {
+            font-size: 12px;
+            color: var(--warn);
+            min-height: 16px;
+            margin-top: 2px
+        }
+
+        .chartbox {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 14px
+        }
+
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 10px
+        }
+
+        button {
+            font: inherit;
+            font-size: 13px;
+            padding: 6px 12px;
+            border-radius: 6px;
+            border: 1px solid var(--line);
+            background: var(--card);
+            color: var(--text);
+            cursor: pointer
+        }
+
+        button.on {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff
+        }
+
+        .sep {
+            width: 1px;
+            background: var(--line);
+            margin: 0 4px
+        }
+
+        canvas {
+            max-height: 320px
+        }
+
+        .section-title {
+            font-size: 14px;
+            color: var(--muted);
+            margin: 16px 0 8px
+        }
+
+        .small {
+            font-size: 12px;
+            color: var(--muted);
+            margin: -4px 0 12px
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 999px;
+            font-weight: 700;
+            font-size: 13px
+        }
+
+        .lv0 {
+            background: var(--info-bg);
+            color: var(--ok)
+        }
+
+        .lv1 {
+            background: var(--warn-bg);
+            color: var(--warn)
+        }
+
+        .lv2 {
+            background: var(--bad-bg);
+            color: var(--bad)
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px
+        }
+
+        th,
+        td {
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--line);
+            text-align: right;
+            white-space: nowrap
+        }
+
+        th:first-child,
+        td:first-child {
+            text-align: left
+        }
+
+        th {
+            color: var(--muted);
+            font-weight: 500
+        }
+
+        .v-warn {
+            color: var(--warn);
+            font-weight: 700
+        }
+
+        .v-bad {
+            color: var(--bad);
+            font-weight: 700
+        }
+    </style>
+</head>
+
+<body>
+    <main>
+        <header>
+            <h1>Giám sát hầm kín</h1>
+            <span id="status">Đang tải...</span>
+        </header>
+
+        <div id="banner"></div>
+
+        <section class="grid">
+            <div class="card">
+                <div class="label">Nhiệt độ</div>
+                <div class="value"><span id="v-temp">—</span><span class="unit">°C</span></div>
+                <div class="note" id="n-temp"></div>
+            </div>
+            <div class="card">
+                <div class="label">Độ ẩm</div>
+                <div class="value"><span id="v-hum">—</span><span class="unit">%RH</span></div>
+                <div class="note" id="n-hum"></div>
+            </div>
+            <div class="card">
+                <div class="label">Bụi</div>
+                <div class="value"><span id="v-dust">—</span><span class="unit">µg/m³</span></div>
+                <div class="note" id="n-dust"></div>
+            </div>
+            <div class="card">
+                <div class="label">Khói (MQ-2)</div>
+                <div class="value"><span id="v-mq2">—</span><span class="unit">mV</span></div>
+                <div class="note" id="n-mq2"></div>
+            </div>
+        </section>
+
+        <div class="section-title">So sánh với Thái Nguyên</div>
+        <section class="grid">
+            <div class="card">
+                <div class="label">Thời tiết Thái Nguyên</div>
+                <div class="value"><span id="city-temp">—</span><span class="unit">°C</span></div>
+                <div class="note" id="city-hum">Độ ẩm: —</div>
+            </div>
+            <div class="card">
+                <div class="label">Bụi Thái Nguyên (PM2.5)</div>
+                <div class="value"><span id="city-pm25">—</span><span class="unit">µg/m³</span></div>
+                <div class="note" id="city-pm25-fc">Dự báo 6h: —</div>
+            </div>
+        </section>
+
+        <div class="section-title">Trung bình 24 giờ qua (Trong hầm)</div>
+        <section class="grid">
+            <div class="card">
+                <div class="label">Nhiệt độ trung bình</div>
+                <div class="value"><span id="a-temp">—</span><span class="unit">°C</span></div>
+            </div>
+            <div class="card">
+                <div class="label">Độ ẩm trung bình</div>
+                <div class="value"><span id="a-hum">—</span><span class="unit">%RH</span></div>
+            </div>
+            <div class="card">
+                <div class="label">Bụi trung bình</div>
+                <div class="value"><span id="a-dust">—</span><span class="unit">µg/m³</span></div>
+            </div>
+        </section>
+        <div class="small" id="a-note"></div>
+
+        <section class="chartbox">
+            <div class="controls" id="controls">
+                <button data-metric="temp" class="on">Nhiệt độ</button>
+                <button data-metric="hum">Độ ẩm</button>
+                <button data-metric="dust">Bụi</button>
+                <button data-metric="mq2">MQ-2</button>
+                <span class="sep"></span>
+                <button data-range="60" class="on">1 giờ</button>
+                <button data-range="360">6 giờ</button>
+                <button data-range="1440">24 giờ</button>
+            </div>
+            <canvas id="chart"></canvas>
+        </section>
+
+        <div class="section-title">Phân tích &amp; Dự báo (AI)</div>
+        <section class="card" style="margin-bottom:12px">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <span id="ai-risk" class="badge lv0">—</span>
+                <span class="small" id="ai-time" style="margin:0"></span>
+            </div>
+            <p id="ai-summary" style="margin:10px 0">Đang tải dự báo...</p>
+            <ul id="ai-reasons" style="margin:0 0 10px;padding-left:18px;font-size:14px"></ul>
+            <div style="overflow-x:auto">
+                <table>
+                    <thead id="ai-head"></thead>
+                    <tbody id="ai-rows"></tbody>
+                </table>
+            </div>
+            <div class="small" id="ai-notes" style="margin:8px 0 0"></div>
+        </section>
+    </main>
+
+    <script>
+        const DB = "https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app";
+
+        // Tên field chuẩn dùng chung với firmware và ai/forecast.py: temp, hum, dust, mq2
+        // rate = tốc độ thay đổi tối đa mỗi giờ (khớp METRICS bên forecast.py)
+        const METRICS = {
+            temp: { label: "Nhiệt độ", unit: "°C", dec: 1, rate: 3, color: "#ef4444" },
+            hum: { label: "Độ ẩm", unit: "%RH", dec: 1, rate: 10, color: "#3b82f6" },
+            dust: { label: "Bụi", unit: "µg/m³", dec: 0, rate: 150, color: "#a16207" },
+            mq2: { label: "Khói (MQ-2)", unit: "mV", dec: 0, rate: 400, color: "#8b5cf6" }
+        };
+        const ORDER = ["temp", "hum", "dust", "mq2"];
+        // Đọc được cả history cũ của firmware <= 1.0.1 (ghi "t"/"h")
+        const ALIAS = { temp: ["temp", "t"], hum: ["hum", "h"], dust: ["dust"], mq2: ["mq2"] };
+        const STALE_MS = 30000;
+        const STALE_AI_MIN = 360;            // dự báo quá 6 giờ mới coi là "cũ"
+
+        // Trạm so sánh: Thái Nguyên. Dashboard tự gọi Open-Meteo nên thời tiết
+        // luôn cập nhật, không phụ thuộc job AI có chạy hay không.
+        const SITE = { name: "Thái Nguyên", lat: 21.5942, lon: 105.8481, tz: "Asia/Ho_Chi_Minh" };
+
+        let metric = "temp", rangePts = 60, chart = null;
+        let latestData = null;               // /latest mới nhất, dùng cho cột "Hiện tại"
+        const currentCells = {};             // ô "Hiện tại" của bảng AI, cập nhật mỗi 5 giây
+        const $ = id => document.getElementById(id);
+        const fmt = (v, d) => (v === null || v === undefined || isNaN(v)) ? "—" : Number(v).toFixed(d);
+
+        function pick(obj, key) {
+            if (!obj) return null;
+            for (const name of ALIAS[key]) {
+                const v = obj[name];
+                if (typeof v === "number" && isFinite(v)) return v;
+            }
+            return null;
+        }
+
+        // Như pick() nhưng cho mảng (dự báo) — chấp nhận cả temp/hum và t/h
+        function pickSeries(obj, key) {
+            if (!obj) return null;
+            for (const name of ALIAS[key]) {
+                const v = obj[name];
+                if (Array.isArray(v)) return v;
+            }
+            return null;
+        }
+
+        async function getJSON(path) {
+            const r = await fetch(DB + path);
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }
+
+        function setStatus(text, ok) {
+            const s = $("status");
+            s.textContent = text;
+            s.className = ok ? "" : "off";
+        }
+
+        function setBanner(cls, text) {
+            const b = $("banner");
+            b.className = cls || "";
+            b.textContent = text || "";
+        }
+
+        // ===== Giá trị "hiện tại" dùng chung =====
+        // Ưu tiên /latest (cảm biến, cập nhật 5 giây/lần) rồi mới tới ảnh chụp
+        // trong payload AI, để cột "Hiện tại" không bao giờ lệch với thẻ phía trên.
+        function liveValue(k) {
+            const live = pick(latestData, k);
+            if (live !== null) return live;
+            return pred && pred.current ? pick(pred.current, k) : null;
+        }
+
+        function updateCurrentCells() {
+            if (!pred) return;
+            ORDER.forEach(k => {
+                const td = currentCells[k];
+                if (!td) return;
+                const value = liveValue(k);
+                td.textContent = fmt(value, METRICS[k].dec) + " " + METRICS[k].unit;
+                td.className = levelClass(value, (pred.thresholds || {})[k]);
+            });
+        }
+
+        // ===== Dữ liệu mới nhất =====
+        async function refreshLatest() {
+            try {
+                const d = await getJSON("/latest.json");
+                if (!d) { setStatus("Chưa có dữ liệu trong /latest", false); return; }
+                latestData = d;
+
+                ORDER.forEach(k => { $("v-" + k).textContent = fmt(pick(d, k), METRICS[k].dec); });
+                updateCurrentCells();        // giữ cột "Hiện tại" luôn khớp cảm biến
+
+                const rs485 = d.modbusOk === false ? "mất kết nối RS485" : "";
+                $("n-temp").textContent = rs485;
+                $("n-hum").textContent = rs485;
+                $("n-dust").textContent = d.noiseDust ? "tín hiệu nhiễu" : "";
+                $("n-mq2").textContent = d.noiseMq2 ? "tín hiệu nhiễu" : (d.warmup ? "đang làm nóng" : "");
+
+                const age = Date.now() - d.ts;
+                const t = new Date(d.ts).toLocaleTimeString("vi-VN");
+                if (!(age <= STALE_MS)) {
+                    setStatus("Thiết bị ngoại tuyến, lần cuối " + t, false);
+                    setBanner("warn", "Không nhận được dữ liệu mới từ thiết bị.");
+                } else {
+                    setStatus("Cập nhật lúc " + t, true);
+                    if (d.alarm) {
+                        const what = [d.smoke ? "khói" : null, d.dustAlarm ? "bụi" : null].filter(Boolean).join(" và ");
+                        setBanner("bad", "CẢNH BÁO: phát hiện " + what + " vượt ngưỡng");
+                    } else if (d.warmup) {
+                        setBanner("info", "MQ-2 đang làm nóng, cảnh báo khói tạm tắt.");
+                    } else {
+                        setBanner("", "");
+                    }
+                }
+            } catch (e) {
+                setStatus("Lỗi kết nối: " + e.message, false);
+            }
+        }
+
+        // ===== Biểu đồ lịch sử + dự báo =====
+        let pred = null, lastLabels = [], lastData = [];
+
+        function fmtLabel(tsSec, long) {
+            const d = new Date(tsSec * 1000);
+            return long
+                ? d.toLocaleString("vi-VN", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })
+                : d.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
+        }
+
+        async function refreshHistory() {
+            try {
+                const q = "?orderBy=" + encodeURIComponent('"$key"') + "&limitToLast=" + rangePts;
+                const o = await getJSON("/history.json" + q);
+                const keys = o ? Object.keys(o).sort((a, b) => a - b) : [];
+                const long = rangePts > 60;
+                lastLabels = keys.map(k => fmtLabel(Number(k), long));
+                lastData = keys.map(k => pick(o[k], metric));
+            } catch (e) {
+                lastLabels = []; lastData = [];
+            }
+            drawChart();
+        }
+
+        function drawChart() {
+            const m = METRICS[metric];
+            const labels = lastLabels.slice(), hist = lastData.slice(), fc = labels.map(() => null);
+
+            const series = pred ? pickSeries(pred.forecast, metric) : null;
+            if (series && series.some(v => typeof v === "number") && hist.length) {
+                const base = pred.baseTs || lastLabels.length;
+                const bin = pred.binMinutes || 60;
+                const last = hist.length - 1;
+                // Nối nét đứt từ giá trị cảm biến hiện tại để không có "vách đứng"
+                const anchor = liveValue(metric);
+                if (anchor !== null) fc[last] = anchor;
+                else if (hist[last] !== null) fc[last] = hist[last];
+                series.forEach((v, i) => {
+                    labels.push(fmtLabel(base + (i + 1) * bin * 60, rangePts > 60));
+                    hist.push(null);
+                    fc.push(typeof v === "number" ? v : null);
+                });
+            }
+
+            if (!chart) {
+                chart = new Chart($("chart"), {
+                    type: "line",
+                    data: {
+                        labels, datasets: [
+                            { label: m.label + " (" + m.unit + ")", data: hist, borderColor: m.color, backgroundColor: m.color, borderWidth: 2, pointRadius: 0, tension: 0.25, spanGaps: false },
+                            { label: "Dự báo AI", data: fc, borderColor: m.color, backgroundColor: m.color, borderWidth: 2, borderDash: [6, 4], pointRadius: 0, tension: 0.25, spanGaps: false }
+                        ]
+                    },
+                    options: {
+                        animation: false, responsive: true,
+                        plugins: { legend: { labels: { color: "#888" } } },
+                        scales: {
+                            x: { ticks: { color: "#888", maxTicksLimit: 8 }, grid: { color: "rgba(128,128,128,0.2)" } },
+                            y: { ticks: { color: "#888" }, grid: { color: "rgba(128,128,128,0.2)" } }
+                        }
+                    }
+                });
+            } else {
+                chart.data.labels = labels;
+                chart.data.datasets.forEach((d, i) => {
+                    d.borderColor = m.color; d.backgroundColor = m.color;
+                    d.data = i === 0 ? hist : fc;
+                });
+                chart.data.datasets[0].label = m.label + " (" + m.unit + ")";
+                chart.update();
+            }
+        }
+
+        // ===== Bảng AI =====
+        function cell(tr, text, cls) {
+            const td = document.createElement("td");
+            td.textContent = text;
+            if (cls) td.className = cls;
+            tr.appendChild(td);
+            return td;
+        }
+
+        // Nhãn cột: bước 5 phút thì ghi "+5p", bước 1 giờ thì ghi "+2h"
+        function horizonLabel(minutes, bin) {
+            if (bin >= 60 && minutes % 60 === 0) return "+" + (minutes / 60) + "h";
+            return "+" + minutes + "p";
+        }
+
+        function levelClass(v, th) {
+            if (!th || v === null || v === undefined) return "";
+            if (v >= th.danger) return "v-bad";
+            if (v >= th.warn) return "v-warn";
+            return "";
+        }
+
+        function renderPred() {
+            const risk = $("ai-risk"), rows = $("ai-rows"), reasons = $("ai-reasons"), head = $("ai-head");
+            rows.textContent = ""; reasons.textContent = ""; head.textContent = ""; $("ai-notes").textContent = "";
+            ORDER.forEach(k => delete currentCells[k]);
+
+            if (!pred) {
+                risk.textContent = "—"; risk.className = "badge lv0";
+                $("ai-summary").textContent = "Chưa có dự báo. Hãy chạy GitHub Actions (AI Forecast Job).";
+                $("ai-time").textContent = "";
+                return;
+            }
+
+            const riskLevel = Number((pred.risk && pred.risk.level) || 0);
+            risk.textContent = (pred.risk && pred.risk.text) || "—";
+            risk.className = "badge lv" + Math.min(2, Math.max(0, riskLevel));
+            $("ai-summary").textContent = pred.summary || "";
+            $("ai-time").textContent = pred.generatedAt
+                ? "Cập nhật lúc " + new Date(pred.generatedAt).toLocaleString("vi-VN")
+                : "";
+
+            ((pred.risk && pred.risk.reasons) || []).forEach(r => {
+                const li = document.createElement("li"); li.textContent = r; reasons.appendChild(li);
+            });
+
+            // Cột dự báo: ưu tiên payload.horizons (schema v2). Payload chỉ có
+            // binMinutes + N điểm (ví dụ 12 điểm × 5 phút) thì tự suy ra mốc.
+            const anySeries = pickSeries(pred.forecast, "temp") || pickSeries(pred.forecast, "hum")
+                || pickSeries(pred.forecast, "dust") || pickSeries(pred.forecast, "mq2") || [];
+            const bin = pred.binMinutes || 5;
+            const horizons = Array.isArray(pred.horizons) && pred.horizons.length
+                ? pred.horizons
+                : anySeries.map((_, i) => (i + 1) * bin);
+            const trh = document.createElement("tr");
+            ["Chỉ số", "Hiện tại"].forEach(t => { const th = document.createElement("th"); th.textContent = t; trh.appendChild(th); });
+            horizons.forEach(h => { const th = document.createElement("th"); th.textContent = horizonLabel(h, bin); trh.appendChild(th); });
+            const thTrend = document.createElement("th"); thTrend.textContent = "Xu hướng"; trh.appendChild(thTrend);
+            head.appendChild(trh);
+
+            const thresholds = pred.thresholds || {};
+            ORDER.forEach(k => {
+                const spec = METRICS[k];
+                const cur = liveValue(k);           // luôn lấy từ cảm biến /latest
+                const fc = pickSeries(pred.forecast, k) || [];
+                const tr = document.createElement("tr");
+                cell(tr, spec.label);
+                currentCells[k] = cell(tr, fmt(cur, spec.dec) + " " + spec.unit, levelClass(cur, thresholds[k]));
+                horizons.forEach((h, i) => cell(tr, fc[i] === null || fc[i] === undefined ? "—" : fmt(fc[i], spec.dec)));
+                const trend = pick(pred.trend, k);
+                cell(tr, (trend === null || trend === undefined)
+                    ? "—"
+                    : (trend > 0 ? "+" : "") + Number(trend).toFixed(2) + " " + spec.unit + "/giờ");
+                rows.appendChild(tr);
+            });
+
+            const notes = [];
+            const q = pred.quality || {};
+            if (q.samples) {
+                const span = q.coverageHours ? " · " + Math.round(q.coverageHours) + " giờ dữ liệu" : "";
+                notes.push(q.samples + " mẫu" + span);
+            }
+            if (q.stale) notes.push("số liệu cảm biến đã cũ " + Math.round(q.ageSec) + "s");
+            if (pred.generatedAt) {
+                const ageMin = (Date.now() - pred.generatedAt) / 60000;
+                // GitHub Actions cron là "best-effort" nên có lúc chạy trễ vài giờ.
+                // Dự báo 2–12 giờ vẫn còn dùng được trong 6 giờ, nên chỉ nhắc khi
+                // thật sự quá cũ; mốc 90 phút chỉ ghi nhẹ để không gây hoang mang.
+                if (ageMin >= STALE_AI_MIN) {
+                    notes.push("dự báo cũ " + (ageMin / 60).toFixed(1) + " giờ — job AI chưa chạy lại (GitHub Actions)");
+                } else if (ageMin >= 90) {
+                    notes.push("dự báo cập nhật " + Math.round(ageMin) + " phút trước");
+                }
+            }
+            if (pred.status && pred.status !== "ok") notes.push("chưa đủ dữ liệu lịch sử để dự báo");
+
+            // Chỉ báo khi THỰC SỰ phát hiện bất thường; bình thường không in tên
+            // thuật toán ra (trước đây in "bất thường: isolation_forest" gây hiểu nhầm).
+            const an = pred.anomaly || {};
+            if (an.isAnomaly === true) {
+                notes.push("phát hiện bất thường đa chiều (" + (an.method || "z-score") + ", điểm " + an.score + ")");
+            }
+
+            // Tên mô hình dự báo, diễn giải cho dễ đọc
+            const METHOD_TEXT = { "mean-revert": "hồi quy về mức nền 24 giờ", "insufficient": "chưa đủ dữ liệu" };
+            const methods = pred.forecastMethod ? Object.values(pred.forecastMethod) : [];
+            const mm = Array.from(new Set(methods.filter(Boolean)));
+            if (mm.length) notes.push("mô hình: " + mm.map(x => METHOD_TEXT[x] || x).join(", "));
+
+            // Dự báo tính trên nền chuỗi 24h, "Hiện tại" là mẫu tức thời:
+            // nếu lệch quá tốc độ cho phép thì nói rõ để không tưởng là lỗi.
+            const jump = ORDER.some(k => {
+                const cur = liveValue(k);
+                const head = (pickSeries(pred.forecast, k) || [])[0] ?? null;
+                return cur !== null && head !== null && Math.abs(head - cur) > METRICS[k].rate;
+            });
+            if (jump) notes.push("dự báo tính từ nền 24 giờ nên có thể lệch mẫu tức thời");
+
+            $("ai-notes").textContent = notes.join(" · ");
+        }
+
+        async function refreshAI() {
+            try {
+                const data = await getJSON("/predictions/latest.json");
+                pred = data && data.schema ? data : (data ? migrateLegacy(data) : null);
+                renderPred();
+            } catch (e) {
+                console.error("AI refresh error:", e);
+                pred = null;
+                renderPred();
+            }
+            drawChart();
+            applyCityFromAI();     // chỉ dùng khi trình duyệt không gọi được Open-Meteo
+        }
+
+        // ===== Thời tiết Thái Nguyên: trình duyệt gọi trực tiếp Open-Meteo =====
+        // Nhờ vậy thẻ thành phố luôn có số, không phụ thuộc job AI còn chạy hay không.
+        let cityFromApi = false;
+
+        async function refreshWeather() {
+            try {
+                const url = "https://api.open-meteo.com/v1/forecast?latitude=" + SITE.lat +
+                    "&longitude=" + SITE.lon +
+                    "&current=temperature_2m,relative_humidity_2m&timezone=" + encodeURIComponent(SITE.tz);
+                const w = await (await fetch(url)).json();
+                const now = (w && w.current) || {};
+                if (typeof now.temperature_2m === "number") $("city-temp").textContent = fmt(now.temperature_2m, 1);
+                if (typeof now.relative_humidity_2m === "number") {
+                    $("city-hum").textContent = "Độ ẩm: " + fmt(now.relative_humidity_2m, 1) + "%";
+                }
+                cityFromApi = true;
+            } catch (e) {
+                console.error("weather error:", e);
+            }
+
+            try {
+                const url = "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=" + SITE.lat +
+                    "&longitude=" + SITE.lon + "&current=pm2_5&hourly=pm2_5&timezone=UTC&forecast_days=1";
+                const a = await (await fetch(url)).json();
+                const now = (a && a.current) || {};
+                if (typeof now.pm2_5 === "number") $("city-pm25").textContent = fmt(now.pm2_5, 1);
+
+                const hourly = (a && a.hourly) || {};
+                const times = hourly.time || [], values = hourly.pm2_5 || [];
+                const key = new Date().toISOString().slice(0, 13) + ":00";   // giờ UTC hiện tại
+                const idx = times.indexOf(key);
+                if (idx >= 0 && idx + 6 < values.length && typeof values[idx + 6] === "number") {
+                    $("city-pm25-fc").textContent = "Dự báo 6h: " + fmt(values[idx + 6], 1) + " µg/m³";
+                }
+                cityFromApi = true;
+            } catch (e) {
+                console.error("air quality error:", e);
+            }
+        }
+
+        function applyCityFromAI() {
+            if (cityFromApi || !pred || !pred.external) return;
+            const ext = normalizeExternal(pred.external);
+            if (!ext) return;
+            if (typeof ext.cityTemp === "number") $("city-temp").textContent = fmt(ext.cityTemp, 1);
+            if (typeof ext.cityHum === "number") $("city-hum").textContent = "Độ ẩm: " + fmt(ext.cityHum, 1) + "%";
+            if (typeof ext.cityPm25 === "number") $("city-pm25").textContent = fmt(ext.cityPm25, 1);
+            if (typeof ext.cityPm25Forecast6h === "number") {
+                $("city-pm25-fc").textContent = "Dự báo 6h: " + fmt(ext.cityPm25Forecast6h, 1) + " µg/m³";
+            }
+        }
+
+        // Chấp nhận cả camelCase (schema v2) và snake_case (payload cũ)
+        function normalizeExternal(ext) {
+            if (!ext) return null;
+            const pickKey = (camel, snake) => (ext[camel] !== undefined ? ext[camel] : ext[snake]);
+            return {
+                city: ext.city,
+                cityTemp: pickKey("cityTemp", "city_temp"),
+                cityHum: pickKey("cityHum", "city_humidity"),
+                cityPm25: pickKey("cityPm25", "city_pm25"),
+                cityPm25Forecast6h: pickKey("cityPm25Forecast6h", "city_pm25_forecast_6h")
+            };
+        }
+
+        // Chuẩn hoá payload không phải schema v2 (khoá t/h, không có horizons…).
+        // Giữ NGUYÊN các field đã có (trend, binMinutes, stats24h, model…) để
+        // không làm mất dữ liệu như bản trước.
+        function migrateLegacy(d) {
+            const lv = d.level === "danger" ? 2 : (d.level === "warn" ? 1 : 0);
+            const forecast = {};
+            const src = d.forecasts || d.forecast || {};
+            Object.keys(src).forEach(k => {
+                const item = src[k];
+                const key = k === "t" ? "temp" : k === "h" ? "hum" : k;
+                if (item && Array.isArray(item)) forecast[key] = item;
+                else if (item && typeof item.value === "number") forecast[key] = [item.value, null, null, null, null, item.value];
+            });
+            return Object.assign({}, d, {
+                status: d.status || "ok",
+                schema: d.schema || 1,
+                generatedAt: d.generatedAt || (d.timestamp || 0) * 1000,
+                risk: d.risk || {
+                    level: lv,
+                    text: lv === 2 ? "NGUY HIỂM" : lv === 1 ? "CẢNH BÁO" : "BÌNH THƯỜNG",
+                    reasons: d.issues || []
+                },
+                summary: d.summary || ((d.issues || []).length
+                    ? "Phát hiện các vấn đề cần chú ý."
+                    : "Tất cả các chỉ số trong ngưỡng an toàn."),
+                current: d.current || d.latest || {},
+                forecast: Object.keys(forecast).length ? forecast : (d.forecast || {}),
+                trend: d.trend || {},
+                thresholds: d.thresholds || {},
+                quality: d.quality || { samples: null },
+                external: normalizeExternal(d.external || d.external_context)
+            });
+        }
+
+        async function refreshDaily() {
+            try {
+                const since = Math.floor(Date.now() / 1000) - 86400;
+                const q = "?orderBy=" + encodeURIComponent('"$key"') + "&startAt=" + encodeURIComponent('"' + since + '"');
+                const o = await getJSON("/history.json" + q);
+                const vals = { temp: [], hum: [], dust: [] };
+                let n = 0;
+                if (o) {
+                    for (const k in o) {
+                        const p = o[k];
+                        if (!p) continue;
+                        n++;
+                        for (const m of ["temp", "hum", "dust"]) {
+                            const v = pick(p, m);
+                            if (v !== null) vals[m].push(v);
+                        }
+                    }
+                }
+                const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+                $("a-temp").textContent = fmt(avg(vals.temp), 1);
+                $("a-hum").textContent = fmt(avg(vals.hum), 1);
+                $("a-dust").textContent = fmt(avg(vals.dust), 0);
+                $("a-note").textContent = n
+                    ? "Tính từ " + n + " mẫu (mỗi mẫu là trung bình 1 phút) trong 24 giờ qua."
+                    : "Chưa có dữ liệu lịch sử trong 24 giờ qua.";
+            } catch (e) {
+                $("a-note").textContent = "Không đọc được dữ liệu lịch sử: " + e.message;
+            }
+        }
+
+        $("controls").addEventListener("click", e => {
+            const b = e.target.closest("button");
+            if (!b) return;
+            if (b.dataset.metric) {
+                metric = b.dataset.metric;
+                document.querySelectorAll("[data-metric]").forEach(x => x.classList.toggle("on", x === b));
+            } else if (b.dataset.range) {
+                rangePts = Number(b.dataset.range);
+                document.querySelectorAll("[data-range]").forEach(x => x.classList.toggle("on", x === b));
+            }
+            refreshHistory();
+        });
+
+        // Khởi chạy
+        refreshLatest();
+        refreshHistory();
+        refreshDaily();
+        refreshAI();
+        refreshWeather();
+
+        // Định kỳ cập nhật
+        setInterval(refreshLatest, 5000);
+        setInterval(refreshHistory, 60000);
+        setInterval(refreshDaily, 300000);
+        setInterval(refreshAI, 300000);
+        setInterval(refreshWeather, 600000);   // thời tiết: 10 phút
+    </script>
+</body>
+
+</html>
