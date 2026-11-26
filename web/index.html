@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Giám sát hầm kín</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            color-scheme: light;
+            --bg: #ffffff;
+            --card: #ffffff;
+            --text: #1c1f24;
+            --muted: #6b7280;
+            --line: #e5e7eb;
+            --ok: #0f766e;
+            --warn: #b45309;
+            --bad: #b91c1c;
+            --accent: #2563eb;
+            --bad-bg: #fee2e2;
+            --warn-bg: #fef3c7;
+            --info-bg: #e0f2fe;
+        }
+
+        * {
+            box-sizing: border-box
+        }
+
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+            line-height: 1.4
+        }
+
+        main {
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 16px
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 12px
+        }
+
+        h1 {
+            font-size: 20px;
+            margin: 0
+        }
+
+        #status {
+            font-size: 13px;
+            color: var(--muted)
+        }
+
+        #status.off {
+            color: var(--bad)
+        }
+
+        #banner {
+            display: none;
+            padding: 10px 14px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            font-weight: 600
+        }
+
+        #banner.bad {
+            display: block;
+            background: var(--bad-bg);
+            color: var(--bad)
+        }
+
+        #banner.warn {
+            display: block;
+            background: var(--warn-bg);
+            color: var(--warn)
+        }
+
+        #banner.info {
+            display: block;
+            background: var(--info-bg);
+            color: var(--accent)
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 12px;
+            margin-bottom: 12px
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 14px
+        }
+
+        .label {
+            font-size: 13px;
+            color: var(--muted)
+        }
+
+        .value {
+            font-size: 30px;
+            font-weight: 700;
+            margin-top: 4px
+        }
+
+        .unit {
+            font-size: 14px;
+            font-weight: 400;
+            color: var(--muted);
+            margin-left: 4px
+        }
+
+        .note {
+            font-size: 12px;
+            color: var(--warn);
+            min-height: 16px;
+            margin-top: 2px
+        }
+
+        .chartbox {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 14px
+        }
+
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 10px
+        }
+
+        button {
+            font: inherit;
+            font-size: 13px;
+            padding: 6px 12px;
+            border-radius: 6px;
+            border: 1px solid var(--line);
+            background: var(--card);
+            color: var(--text);
+            cursor: pointer
+        }
+
+        button.on {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff
+        }
+
+        .sep {
+            width: 1px;
+            background: var(--line);
+            margin: 0 4px
+        }
+
+        canvas {
+            max-height: 320px
+        }
+
+        .section-title {
+            font-size: 14px;
+            color: var(--muted);
+            margin: 16px 0 8px
+        }
+
+        .small {
+            font-size: 12px;
+            color: var(--muted);
+            margin: -4px 0 12px
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 999px;
+            font-weight: 700;
+            font-size: 13px
+        }
+
+        .lv0 {
+            background: var(--info-bg);
+            color: var(--ok)
+        }
+
+        .lv1 {
+            background: var(--warn-bg);
+            color: var(--warn)
+        }
+
+        .lv2 {
+            background: var(--bad-bg);
+            color: var(--bad)
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px
+        }
+
+        th,
+        td {
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--line);
+            text-align: right;
+            white-space: nowrap
+        }
+
+        th:first-child,
+        td:first-child {
+            text-align: left
+        }
+
+        th {
+            color: var(--muted);
+            font-weight: 500
+        }
+    </style>
+</head>
+
+<body>
+    <main>
+        <header>
+            <h1>Giám sát hầm kín</h1>
+            <span id="status">Đang tải...</span>
+        </header>
+
+        <div id="banner"></div>
+
+        <section class="grid">
+            <div class="card">
+                <div class="label">Nhiệt độ</div>
+                <div class="value"><span id="v-temp">—</span><span class="unit">°C</span></div>
+                <div class="note" id="n-temp"></div>
+            </div>
+            <div class="card">
+                <div class="label">Độ ẩm</div>
+                <div class="value"><span id="v-hum">—</span><span class="unit">%RH</span></div>
+                <div class="note" id="n-hum"></div>
+            </div>
+            <div class="card">
+                <div class="label">Bụi</div>
+                <div class="value"><span id="v-dust">—</span><span class="unit">µg/m³</span></div>
+                <div class="note" id="n-dust"></div>
+            </div>
+            <div class="card">
+                <div class="label">Khói (MQ-2)</div>
+                <div class="value"><span id="v-mq2">—</span><span class="unit">mV</span></div>
+                <div class="note" id="n-mq2"></div>
+            </div>
+        </section>
+
+        <div class="section-title">So sánh với thành phố</div>
+        <section class="grid">
+            <div class="card">
+                <div class="label">Thời tiết TP</div>
+                <div class="value"><span id="city-temp">—</span><span class="unit">°C</span></div>
+                <div class="note" id="city-hum">Độ ẩm: —</div>
+            </div>
+            <div class="card">
+                <div class="label">Bụi TP (PM2.5)</div>
+                <div class="value"><span id="city-pm25">—</span><span class="unit">µg/m³</span></div>
+                <div class="note" id="city-pm25-fc">Dự báo 6h: —</div>
+            </div>
+        </section>
+
+        <div class="section-title">Trung bình 24 giờ qua (Trong hầm)</div>
+        <section class="grid">
+            <div class="card">
+                <div class="label">Nhiệt độ trung bình</div>
+                <div class="value"><span id="a-temp">—</span><span class="unit">°C</span></div>
+            </div>
+            <div class="card">
+                <div class="label">Độ ẩm trung bình</div>
+                <div class="value"><span id="a-hum">—</span><span class="unit">%RH</span></div>
+            </div>
+            <div class="card">
+                <div class="label">Bụi trung bình</div>
+                <div class="value"><span id="a-dust">—</span><span class="unit">µg/m³</span></div>
+            </div>
+        </section>
+        <div class="small" id="a-note"></div>
+
+        <section class="chartbox">
+            <div class="controls" id="controls">
+                <button data-metric="t" class="on">Nhiệt độ</button>
+                <button data-metric="h">Độ ẩm</button>
+                <button data-metric="dust">Bụi</button>
+                <button data-metric="mq2">MQ-2</button>
+                <span class="sep"></span>
+                <button data-range="60" class="on">1 giờ</button>
+                <button data-range="360">6 giờ</button>
+                <button data-range="1440">24 giờ</button>
+            </div>
+            <canvas id="chart"></canvas>
+        </section>
+
+        <div class="section-title">Phân tích & Dự báo (AI)</div>
+        <section class="card" style="margin-bottom:12px">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <span id="ai-risk" class="badge lv0">—</span>
+                <span class="small" id="ai-time" style="margin:0"></span>
+            </div>
+            <p id="ai-summary" style="margin:10px 0">Đang tải dự báo...</p>
+            <ul id="ai-reasons" style="margin:0 0 10px;padding-left:18px;font-size:14px"></ul>
+            <div style="overflow-x:auto">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Chỉ số</th>
+                            <th>Hiện tại</th>
+                            <th>+30 phút</th>
+                            <th>Dự báo 6h tới</th>
+                            <th>Xu hướng</th>
+                        </tr>
+                    </thead>
+                    <tbody id="ai-rows"></tbody>
+                </table>
+            </div>
+            <div class="small" id="ai-notes" style="margin:8px 0 0"></div>
+        </section>
+    </main>
+
+    <script>
+        const DB = "https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app";
+
+        const METRICS = {
+            t: { label: "Nhiệt độ (°C)", color: "#ef4444" },
+            h: { label: "Độ ẩm (%RH)", color: "#3b82f6" },
+            dust: { label: "Bụi (µg/m³)", color: "#a16207" },
+            mq2: { label: "MQ-2 (mV)", color: "#8b5cf6" }
+        };
+        const STALE_MS = 30000;
+
+        let metric = "t", rangePts = 60, chart = null;
+        const $ = id => document.getElementById(id);
+        const fmt = (v, d) => (v === null || v === undefined) ? "—" : Number(v).toFixed(d);
+
+        async function getJSON(path) {
+            const r = await fetch(DB + path);
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        }
+
+        function setStatus(text, ok) {
+            const s = $("status");
+            s.textContent = text;
+            s.className = ok ? "" : "off";
+        }
+
+        function setBanner(cls, text) {
+            const b = $("banner");
+            b.className = cls || "";
+            b.textContent = text || "";
+        }
+
+        async function refreshLatest() {
+            try {
+                const d = await getJSON("/latest.json");
+                if (!d) { setStatus("Chưa có dữ liệu trong /latest", false); return; }
+
+                $("v-temp").textContent = fmt(d.temp, 1);
+                $("v-hum").textContent = fmt(d.hum, 1);
+                $("v-dust").textContent = fmt(d.dust, 0);
+                $("v-mq2").textContent = fmt(d.mq2, 0);
+                $("n-temp").textContent = d.modbusOk === false ? "mất kết nối RS485" : "";
+                $("n-hum").textContent = d.modbusOk === false ? "mất kết nối RS485" : "";
+                $("n-dust").textContent = d.noiseDust ? "tín hiệu nhiễu" : "";
+                $("n-mq2").textContent = d.noiseMq2 ? "tín hiệu nhiễu" : (d.warmup ? "đang làm nóng" : "");
+
+                const age = Date.now() - d.ts;
+                const t = new Date(d.ts).toLocaleTimeString("vi-VN");
+                if (age > STALE_MS) {
+                    setStatus("Thiết bị ngoại tuyến, lần cuối " + t, false);
+                    setBanner("warn", "Không nhận được dữ liệu mới từ thiết bị.");
+                } else {
+                    setStatus("Cập nhật lúc " + t, true);
+                    if (d.alarm) {
+                        const what = [d.smoke ? "khói" : null, d.dustAlarm ? "bụi" : null].filter(Boolean).join(" và ");
+                        setBanner("bad", "CẢNH BÁO: phát hiện " + what + " vượt ngưỡng");
+                    } else if (d.warmup) {
+                        setBanner("info", "MQ-2 đang làm nóng, cảnh báo khói tạm tắt.");
+                    } else {
+                        setBanner("", "");
+                    }
+                }
+            } catch (e) {
+                setStatus("Lỗi kết nối: " + e.message, false);
+            }
+        }
+
+        let pred = null, lastLabels = [], lastData = [];
+
+        function fmtLabel(tsSec, long) {
+            const d = new Date(tsSec * 1000);
+            return long
+                ? d.toLocaleString("vi-VN", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })
+                : d.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
+        }
+
+        async function refreshHistory() {
+            try {
+                const q = "?orderBy=" + encodeURIComponent('"$key"') + "&limitToLast=" + rangePts;
+                const o = await getJSON("/history.json" + q);
+                const keys = o ? Object.keys(o).sort((a, b) => a - b) : [];
+                const long = rangePts > 60;
+                lastLabels = keys.map(k => fmtLabel(Number(k), long));
+                lastData = keys.map(k => (o[k] && typeof o[k][metric] === "number") ? o[k][metric] : null);
+            } catch (e) {
+                lastLabels = []; lastData = [];
+            }
+            drawChart();
+        }
+
+        function drawChart() {
+            const m = METRICS[metric];
+            const labels = lastLabels.slice(), hist = lastData.slice(), fc = labels.map(() => null);
+            const f = pred && pred.status === "ok" && pred.forecast && pred.forecast[metric];
+            if (f && hist.length) {
+                const last = hist.length - 1, long = rangePts > 60;
+                if (hist[last] !== null) fc[last] = hist[last];
+                f.forEach((v, i) => {
+                    labels.push(fmtLabel(pred.baseTs + (i + 1) * pred.binMinutes * 60, long));
+                    hist.push(null);
+                    fc.push(v);
+                });
+            }
+            if (!chart) {
+                chart = new Chart($("chart"), {
+                    type: "line",
+                    data: {
+                        labels, datasets: [
+                            { label: m.label, data: hist, borderColor: m.color, backgroundColor: m.color, borderWidth: 2, pointRadius: 0, tension: 0.25, spanGaps: false },
+                            { label: "Dự báo AI", data: fc, borderColor: m.color, backgroundColor: m.color, borderWidth: 2, borderDash: [6, 4], pointRadius: 0, tension: 0.25, spanGaps: false }
+                        ]
+                    },
+                    options: {
+                        animation: false, responsive: true,
+                        plugins: { legend: { labels: { color: "#888" } } },
+                        scales: {
+                            x: { ticks: { color: "#888", maxTicksLimit: 8 }, grid: { color: "rgba(128,128,128,0.2)" } },
+                            y: { ticks: { color: "#888" }, grid: { color: "rgba(128,128,128,0.2)" } }
+                        }
+                    }
+                });
+            } else {
+                chart.data.labels = labels;
+                chart.data.datasets.forEach((d, i) => {
+                    d.borderColor = m.color; d.backgroundColor = m.color;
+                    d.data = i === 0 ? hist : fc;
+                });
+                chart.data.datasets[0].label = m.label;
+                chart.update();
+            }
+        }
+
+        const AI_ORDER = [["t", "Nhiệt độ", "°C", 1], ["h", "Độ ẩm", "%RH", 1], ["dust", "Bụi", "µg/m³", 0], ["mq2", "Khói (MQ-2)", "mV", 0]];
+
+        function cell(tr, text) {
+            const td = document.createElement("td");
+            td.textContent = text;
+            tr.appendChild(td);
+        }
+
+        function renderPred() {
+            const risk = $("ai-risk"), rows = $("ai-rows"), reasons = $("ai-reasons");
+            rows.textContent = ""; reasons.textContent = ""; $("ai-notes").textContent = "";
+
+            if (!pred) {
+                risk.textContent = "—"; risk.className = "badge lv0";
+                $("ai-summary").textContent = "Chưa có dự báo. Hãy chạy script AI (GitHub Actions).";
+                $("ai-time").textContent = "";
+                return;
+            }
+
+            const lv = pred.risk ? pred.risk.level : 0;
+            risk.textContent = pred.risk ? pred.risk.text : "—";
+            risk.className = "badge lv" + lv;
+            $("ai-summary").textContent = pred.summary || "";
+            $("ai-time").textContent = pred.generatedAt ? "Cập nhật lúc " + new Date(pred.generatedAt).toLocaleString("vi-VN") : "";
+
+            ((pred.risk && pred.risk.reasons) || []).forEach(r => {
+                const li = document.createElement("li"); li.textContent = r; reasons.appendChild(li);
+            });
+
+            if (pred.status !== "ok") return;
+
+            AI_ORDER.forEach(([k, name, unit, dec]) => {
+                const f = pred.forecast && pred.forecast[k], q = pred.quality && pred.quality[k];
+                const fm = v => (v === null || v === undefined) ? "—" : Number(v).toFixed(dec) + " " + unit;
+                const tr = document.createElement("tr");
+                cell(tr, name);
+                cell(tr, fm(pred.current && pred.current[k]));
+                // Sửa lại chỉ số mảng cho đúng với dữ liệu trả về của AI: 0 là +15p, 1 là +30p, 2 là +60p
+                cell(tr, f ? fm(f[1]) : "—"); // +30 phút
+                cell(tr, f ? fm(f[5]) : "—"); // +6 giờ (khoảng 360 phút)
+                const tr1 = pred.trend && pred.trend[k];
+                cell(tr, (tr1 === null || tr1 === undefined) ? "—" : (tr1 > 0 ? "+" : "") + tr1 + " " + unit + "/giờ");
+                rows.appendChild(tr);
+            });
+        }
+
+        async function refreshAI() {
+            try {
+                // Đọc từ Firebase thay vì gọi server Python
+                const data = await getJSON("/ai_analysis.json");
+                if (!data) {
+                    pred = null;
+                    renderPred();
+                    return;
+                }
+
+                // Chuyển đổi dữ liệu từ forecast.py sang cấu trúc mà renderPred mong muốn
+                pred = {
+                    status: "ok",
+                    generatedAt: data.timestamp * 1000,
+                    risk: {
+                        level: data.level === "danger" ? 2 : (data.level === "warn" ? 1 : 0),
+                        text: data.level === "danger" ? "NGUY HIỂM" : (data.level === "warn" ? "CẢNH BÁO" : "BÌNH THƯỜNG"),
+                        reasons: data.issues || []
+                    },
+                    summary: data.issues.length ? "Phát hiện các vấn đề cần chú ý." : "Tất cả các chỉ số trong ngưỡng an toàn.",
+                    current: data.latest,
+                    forecast: {}
+                };
+
+                // Chuyển đổi mảng dự báo
+                Object.keys(data.forecasts).forEach(k => {
+                    const fc = data.forecasts[k];
+                    if (fc && fc.value !== null) {
+                        // Giả lập mảng dự báo 6h (vì forecast.py hiện tại chỉ trả về 1 giá trị cuối)
+                        // Tạo một mảng giả có 6 phần tử, các phần tử trước bằng giá trị hiện tại, phần tử cuối là giá trị dự báo
+                        const val = fc.value;
+                        pred.forecast[k] = [val, val, val, val, val, val];
+                    }
+                });
+
+                renderPred();
+
+                // Hiển thị thời tiết so sánh
+                if (data.external_context) {
+                    $("city-temp").textContent = data.external_context.city_temp ?? "—";
+                    $("city-hum").textContent = "Độ ẩm: " + (data.external_context.city_humidity ?? "—") + "%";
+                    $("city-pm25").textContent = data.external_context.city_pm25 ?? "—";
+                    $("city-pm25-fc").textContent = "Dự báo 6h: " + (data.external_context.city_pm25_forecast_6h ?? "—") + " µg/m³";
+                }
+
+            } catch (e) {
+                console.error("AI refresh error:", e);
+                pred = null;
+                renderPred();
+            }
+        }
+
+        async function refreshDaily() {
+            try {
+                const since = Math.floor(Date.now() / 1000) - 86400;
+                const q = "?orderBy=" + encodeURIComponent('"$key"') + "&startAt=" + encodeURIComponent('"' + since + '"');
+                const o = await getJSON("/history.json" + q);
+                const vals = { t: [], h: [], dust: [] };
+                let n = 0;
+                if (o) {
+                    for (const k in o) {
+                        const p = o[k];
+                        if (!p) continue;
+                        n++;
+                        for (const m of ["t", "h", "dust"]) {
+                            if (typeof p[m] === "number") vals[m].push(p[m]);
+                        }
+                    }
+                }
+                const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+                $("a-temp").textContent = fmt(avg(vals.t), 1);
+                $("a-hum").textContent = fmt(avg(vals.h), 1);
+                $("a-dust").textContent = fmt(avg(vals.dust), 0);
+                $("a-note").textContent = n
+                    ? "Tính từ " + n + " mẫu (mỗi mẫu là trung bình 1 phút) trong 24 giờ qua."
+                    : "Chưa có dữ liệu lịch sử trong 24 giờ qua.";
+            } catch (e) {
+                $("a-note").textContent = "Không đọc được dữ liệu lịch sử: " + e.message;
+            }
+        }
+
+        $("controls").addEventListener("click", e => {
+            const b = e.target.closest("button");
+            if (!b) return;
+            if (b.dataset.metric) {
+                metric = b.dataset.metric;
+                document.querySelectorAll("[data-metric]").forEach(x => x.classList.toggle("on", x === b));
+            } else if (b.dataset.range) {
+                rangePts = Number(b.dataset.range);
+                document.querySelectorAll("[data-range]").forEach(x => x.classList.toggle("on", x === b));
+            }
+            refreshHistory();
+            drawChart();
+        });
+
+        // Khởi chạy
+        refreshLatest();
+        refreshHistory();
+        refreshDaily();
+        refreshAI();
+
+        // Định kỳ cập nhật
+        setInterval(refreshLatest, 5000);
+        setInterval(refreshHistory, 60000);
+        setInterval(refreshDaily, 300000);
+        setInterval(refreshAI, 300000); // Cập nhật AI mỗi 5 phút
+    </script>
+</body>
+
+</html>

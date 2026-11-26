@@ -1,0 +1,26 @@
+name: AI Forecast Job
+
+on:
+  schedule:
+    - cron: '*/30 * * * *' # Chạy mỗi 30 phút
+  workflow_dispatch:       # Cho phép bấm chạy thủ công
+
+jobs:
+  run-ai:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          cd ai
+          pip install requests numpy pandas statsmodels scikit-learn
+      - name: Run AI
+        env:
+          FIREBASE_DB_URL: "https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app"
+        run: |
+          cd ai
+          python forecast.py
