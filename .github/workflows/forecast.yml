@@ -1,11 +1,12 @@
+
 name: AI Forecast Job
 
 on:
   schedule:
     - cron: '*/30 * * * *' # Chạy mỗi 30 phút
-  workflow_dispatch: # Cho phép bấm chạy thủ công
+  workflow_dispatch:
 
-# Không cho 2 lần chạy chồng nhau (tránh ghi đè /predictions/latest lộn xộn)
+# Không cho 2 lần chạy chồng nhau
 concurrency:
   group: ai-forecast
   cancel-in-progress: false
@@ -14,35 +15,34 @@ jobs:
   run-ai:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     steps:
       - uses: actions/checkout@v4
 
-       - name: Set up Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          # KHÔNG bật cache: pip (nó bắt buộc phải có requirements.txt)
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+
           if [ -f ai/requirements.txt ]; then
+            echo "Tim thay requirements.txt"
             pip install -r ai/requirements.txt
           else
-            echo "Chưa có ai/requirements.txt -> cài trực tiếp"
+            echo "Khong tim thay requirements.txt"
+            echo "Tien hanh cai thu vien truc tiep"
             pip install numpy scikit-learn
           fi
 
       - name: Run AI
         env:
-          # Dùng secret FIREBASE_DB_URL nếu có, không thì lấy URL mặc định
           FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL || 'https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app' }}
           FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
-          # Secret trong repo đang đặt tên là AI_EMAIL / AI_PASSWORD
           FIREBASE_EMAIL: ${{ secrets.AI_EMAIL }}
           FIREBASE_PASSWORD: ${{ secrets.AI_PASSWORD }}
           PYTHONUNBUFFERED: "1"
-        # Bước 1 (tuỳ chọn): kiểm tra đăng nhập, lỗi sẽ đọc được ngay
-        # run: python ai/forecast.py --check-auth
-        # Bước 2: chạy thật (bỏ run của --check-auth ở trên rồi dùng dòng dưới)
+
         run: python ai/forecast.py
