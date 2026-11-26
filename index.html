@@ -23,7 +23,7 @@
             --info-bg: #e0f2fe;
         }
 
-- {
+        * {
             box-sizing: border-box
         }
 
@@ -228,6 +228,16 @@
             color: var(--muted);
             font-weight: 500
         }
+
+        .v-warn {
+            color: var(--warn);
+            font-weight: 700
+        }
+
+        .v-bad {
+            color: var(--bad);
+            font-weight: 700
+        }
     </style>
 </head>
 
@@ -296,8 +306,8 @@
 
         <section class="chartbox">
             <div class="controls" id="controls">
-                <button data-metric="t" class="on">Nhiệt độ</button>
-                <button data-metric="h">Độ ẩm</button>
+                <button data-metric="temp" class="on">Nhiệt độ</button>
+                <button data-metric="hum">Độ ẩm</button>
                 <button data-metric="dust">Bụi</button>
                 <button data-metric="mq2">MQ-2</button>
                 <span class="sep"></span>
@@ -308,7 +318,7 @@
             <canvas id="chart"></canvas>
         </section>
 
-        <div class="section-title">Phân tích & Dự báo (AI)</div>
+        <div class="section-title">Phân tích &amp; Dự báo (AI)</div>
         <section class="card" style="margin-bottom:12px">
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
                 <span id="ai-risk" class="badge lv0">—</span>
@@ -318,15 +328,7 @@
             <ul id="ai-reasons" style="margin:0 0 10px;padding-left:18px;font-size:14px"></ul>
             <div style="overflow-x:auto">
                 <table>
-                    <thead>
-                        <tr>
-                            <th>Chỉ số</th>
-                            <th>Hiện tại</th>
-                            <th>+30 phút</th>
-                            <th>Dự báo 6h tới</th>
-                            <th>Xu hướng</th>
-                        </tr>
-                    </thead>
+                    <thead id="ai-head"></thead>
                     <tbody id="ai-rows"></tbody>
                 </table>
             </div>
@@ -337,17 +339,31 @@
     <script>
         const DB = "https://khoitrongham-default-rtdb.asia-southeast1.firebasedatabase.app";
 
+        // Tên field chuẩn dùng chung với firmware và ai/forecast.py: temp, hum, dust, mq2
+        // rate = tốc độ thay đổi tối đa mỗi giờ (khớp METRICS bên forecast.py)
         const METRICS = {
-            t: { label: "Nhiệt độ (°C)", color: "#ef4444" },
-            h: { label: "Độ ẩm (%RH)", color: "#3b82f6" },
-            dust: { label: "Bụi (µg/m³)", color: "#a16207" },
-            mq2: { label: "MQ-2 (mV)", color: "#8b5cf6" }
+            temp: { label: "Nhiệt độ", unit: "°C", dec: 1, rate: 3, color: "#ef4444" },
+            hum: { label: "Độ ẩm", unit: "%RH", dec: 1, rate: 10, color: "#3b82f6" },
+            dust: { label: "Bụi", unit: "µg/m³", dec: 0, rate: 150, color: "#a16207" },
+            mq2: { label: "Khói (MQ-2)", unit: "mV", dec: 0, rate: 400, color: "#8b5cf6" }
         };
+        const ORDER = ["temp", "hum", "dust", "mq2"];
+        // Đọc được cả history cũ của firmware <= 1.0.1 (ghi "t"/"h")
+        const ALIAS = { temp: ["temp", "t"], hum: ["hum", "h"], dust: ["dust"], mq2: ["mq2"] };
         const STALE_MS = 30000;
 
-        let metric = "t", rangePts = 60, chart = null;
+        let metric = "temp", rangePts = 60, chart = null;
         const $ = id => document.getElementById(id);
-        const fmt = (v, d) => (v === null || v === undefined) ? "—" : Number(v).toFixed(d);
+        const fmt = (v, d) => (v === null || v === undefined || isNaN(v)) ? "—" : Number(v).toFixed(d);
+
+        function pick(obj, key) {
+            if (!obj) return null;
+            for (const name of ALIAS[key]) {
+                const v = obj[name];
+                if (typeof v === "number" && isFinite(v)) return v;
+            }
+            return null;
+        }
 
         async function getJSON(path) {
             const r = await fetch(DB + path);
@@ -367,23 +383,23 @@
             b.textContent = text || "";
         }
 
+        // ===== Dữ liệu mới nhất =====
         async function refreshLatest() {
             try {
                 const d = await getJSON("/latest.json");
                 if (!d) { setStatus("Chưa có dữ liệu trong /latest", false); return; }
 
-                $("v-temp").textContent = fmt(d.temp, 1);
-                $("v-hum").textContent = fmt(d.hum, 1);
-                $("v-dust").textContent = fmt(d.dust, 0);
-                $("v-mq2").textContent = fmt(d.mq2, 0);
-                $("n-temp").textContent = d.modbusOk === false ? "mất kết nối RS485" : "";
-                $("n-hum").textContent = d.modbusOk === false ? "mất kết nối RS485" : "";
+                ORDER.forEach(k => { $("v-" + k).textContent = fmt(pick(d, k), METRICS[k].dec); });
+
+                const rs485 = d.modbusOk === false ? "mất kết nối RS485" : "";
+                $("n-temp").textContent = rs485;
+                $("n-hum").textContent = rs485;
                 $("n-dust").textContent = d.noiseDust ? "tín hiệu nhiễu" : "";
                 $("n-mq2").textContent = d.noiseMq2 ? "tín hiệu nhiễu" : (d.warmup ? "đang làm nóng" : "");
 
                 const age = Date.now() - d.ts;
                 const t = new Date(d.ts).toLocaleTimeString("vi-VN");
-                if (age > STALE_MS) {
+                if (!(age <= STALE_MS)) {
                     setStatus("Thiết bị ngoại tuyến, lần cuối " + t, false);
                     setBanner("warn", "Không nhận được dữ liệu mới từ thiết bị.");
                 } else {
@@ -402,6 +418,7 @@
             }
         }
 
+        // ===== Biểu đồ lịch sử + dự báo =====
         let pred = null, lastLabels = [], lastData = [];
 
         function fmtLabel(tsSec, long) {
@@ -418,7 +435,7 @@
                 const keys = o ? Object.keys(o).sort((a, b) => a - b) : [];
                 const long = rangePts > 60;
                 lastLabels = keys.map(k => fmtLabel(Number(k), long));
-                lastData = keys.map(k => (o[k] && typeof o[k][metric] === "number") ? o[k][metric] : null);
+                lastData = keys.map(k => pick(o[k], metric));
             } catch (e) {
                 lastLabels = []; lastData = [];
             }
@@ -428,22 +445,27 @@
         function drawChart() {
             const m = METRICS[metric];
             const labels = lastLabels.slice(), hist = lastData.slice(), fc = labels.map(() => null);
-            const f = pred && pred.status === "ok" && pred.forecast && pred.forecast[metric];
-            if (f && hist.length) {
-                const last = hist.length - 1, long = rangePts > 60;
+
+            const series = pred && Array.isArray(pred.forecast && pred.forecast[metric])
+                ? pred.forecast[metric] : null;
+            if (series && series.some(v => typeof v === "number") && hist.length) {
+                const base = pred.baseTs || lastLabels.length;
+                const bin = pred.binMinutes || 60;
+                const last = hist.length - 1;
                 if (hist[last] !== null) fc[last] = hist[last];
-                f.forEach((v, i) => {
-                    labels.push(fmtLabel(pred.baseTs + (i + 1) * pred.binMinutes * 60, long));
+                series.forEach((v, i) => {
+                    labels.push(fmtLabel(base + (i + 1) * bin * 60, rangePts > 60));
                     hist.push(null);
-                    fc.push(v);
+                    fc.push(typeof v === "number" ? v : null);
                 });
             }
+
             if (!chart) {
                 chart = new Chart($("chart"), {
                     type: "line",
                     data: {
                         labels, datasets: [
-                            { label: m.label, data: hist, borderColor: m.color, backgroundColor: m.color, borderWidth: 2, pointRadius: 0, tension: 0.25, spanGaps: false },
+                            { label: m.label + " (" + m.unit + ")", data: hist, borderColor: m.color, backgroundColor: m.color, borderWidth: 2, pointRadius: 0, tension: 0.25, spanGaps: false },
                             { label: "Dự báo AI", data: fc, borderColor: m.color, backgroundColor: m.color, borderWidth: 2, borderDash: [6, 4], pointRadius: 0, tension: 0.25, spanGaps: false }
                         ]
                     },
@@ -462,107 +484,147 @@
                     d.borderColor = m.color; d.backgroundColor = m.color;
                     d.data = i === 0 ? hist : fc;
                 });
-                chart.data.datasets[0].label = m.label;
+                chart.data.datasets[0].label = m.label + " (" + m.unit + ")";
                 chart.update();
             }
         }
 
-        const AI_ORDER = [["t", "Nhiệt độ", "°C", 1], ["h", "Độ ẩm", "%RH", 1], ["dust", "Bụi", "µg/m³", 0], ["mq2", "Khói (MQ-2)", "mV", 0]];
-
-        function cell(tr, text) {
+        // ===== Bảng AI =====
+        function cell(tr, text, cls) {
             const td = document.createElement("td");
             td.textContent = text;
+            if (cls) td.className = cls;
             tr.appendChild(td);
+            return td;
+        }
+
+        function horizonLabel(minutes) {
+            if (minutes % 60 === 0) return "+" + (minutes / 60) + "h";
+            return "+" + minutes + "p";
+        }
+
+        function levelClass(v, th) {
+            if (!th || v === null || v === undefined) return "";
+            if (v >= th.danger) return "v-bad";
+            if (v >= th.warn) return "v-warn";
+            return "";
         }
 
         function renderPred() {
-            const risk = $("ai-risk"), rows = $("ai-rows"), reasons = $("ai-reasons");
-            rows.textContent = ""; reasons.textContent = ""; $("ai-notes").textContent = "";
+            const risk = $("ai-risk"), rows = $("ai-rows"), reasons = $("ai-reasons"), head = $("ai-head");
+            rows.textContent = ""; reasons.textContent = ""; head.textContent = ""; $("ai-notes").textContent = "";
 
             if (!pred) {
                 risk.textContent = "—"; risk.className = "badge lv0";
-                $("ai-summary").textContent = "Chưa có dự báo. Hãy chạy script AI (GitHub Actions).";
+                $("ai-summary").textContent = "Chưa có dự báo. Hãy chạy GitHub Actions (AI Forecast Job).";
                 $("ai-time").textContent = "";
                 return;
             }
 
-            const lv = pred.risk ? pred.risk.level : 0;
-            risk.textContent = pred.risk ? pred.risk.text : "—";
-            risk.className = "badge lv" + lv;
+            const riskLevel = Number((pred.risk && pred.risk.level) || 0);
+            risk.textContent = (pred.risk && pred.risk.text) || "—";
+            risk.className = "badge lv" + Math.min(2, Math.max(0, riskLevel));
             $("ai-summary").textContent = pred.summary || "";
-            $("ai-time").textContent = pred.generatedAt ? "Cập nhật lúc " + new Date(pred.generatedAt).toLocaleString("vi-VN") : "";
+            $("ai-time").textContent = pred.generatedAt
+                ? "Cập nhật lúc " + new Date(pred.generatedAt).toLocaleString("vi-VN")
+                : "";
 
             ((pred.risk && pred.risk.reasons) || []).forEach(r => {
                 const li = document.createElement("li"); li.textContent = r; reasons.appendChild(li);
             });
 
-            if (pred.status !== "ok") return;
+            const horizons = Array.isArray(pred.horizons) && pred.horizons.length
+                ? pred.horizons : [60, 120, 180, 240, 300, 360];
+            const trh = document.createElement("tr");
+            ["Chỉ số", "Hiện tại"].forEach(t => { const th = document.createElement("th"); th.textContent = t; trh.appendChild(th); });
+            horizons.forEach(h => { const th = document.createElement("th"); th.textContent = horizonLabel(h); trh.appendChild(th); });
+            const thTrend = document.createElement("th"); thTrend.textContent = "Xu hướng"; trh.appendChild(thTrend);
+            head.appendChild(trh);
 
-            AI_ORDER.forEach(([k, name, unit, dec]) => {
-                const f = pred.forecast && pred.forecast[k], q = pred.quality && pred.quality[k];
-                const fm = v => (v === null || v === undefined) ? "—" : Number(v).toFixed(dec) + " " + unit;
+            const thresholds = pred.thresholds || {};
+            ORDER.forEach(k => {
+                const spec = METRICS[k];
+                const cur = pred.current ? pick(pred.current, k) : null;
+                const fc = (pred.forecast && pred.forecast[k]) || [];
                 const tr = document.createElement("tr");
-                cell(tr, name);
-                cell(tr, fm(pred.current && pred.current[k]));
-                // Sửa lại chỉ số mảng cho đúng với dữ liệu trả về của AI: 0 là +15p, 1 là +30p, 2 là +60p
-                cell(tr, f ? fm(f[1]) : "—"); // +30 phút
-                cell(tr, f ? fm(f[5]) : "—"); // +6 giờ (khoảng 360 phút)
-                const tr1 = pred.trend && pred.trend[k];
-                cell(tr, (tr1 === null || tr1 === undefined) ? "—" : (tr1 > 0 ? "+" : "") + tr1 + " " + unit + "/giờ");
+                cell(tr, spec.label);
+                cell(tr, fmt(cur, spec.dec) + " " + spec.unit, levelClass(cur, thresholds[k]));
+                horizons.forEach((h, i) => cell(tr, fc[i] === null || fc[i] === undefined ? "—" : fmt(fc[i], spec.dec)));
+                const trend = pred.trend ? pred.trend[k] : null;
+                cell(tr, (trend === null || trend === undefined)
+                    ? "—"
+                    : (trend > 0 ? "+" : "") + Number(trend).toFixed(2) + " " + spec.unit + "/giờ");
                 rows.appendChild(tr);
             });
+
+            const notes = [];
+            const q = pred.quality || {};
+            if (q.samples) notes.push(q.samples + " mẫu" + (q.coverageHours ? " / " + q.coverageHours + " giờ" : ""));
+            if (q.stale) notes.push("dữ liệu đã cũ " + Math.round(q.ageSec) + "s");
+            if (pred.status && pred.status !== "ok") notes.push("chưa đủ dữ liệu lịch sử để dự báo");
+            if (pred.anomaly && pred.anomaly.method && pred.anomaly.method !== "none") {
+                notes.push("bất thường: " + pred.anomaly.method);
+            }
+            const methods = pred.forecastMethod ? Object.values(pred.forecastMethod) : [];
+            const mm = Array.from(new Set(methods.filter(Boolean)));
+            if (mm.length) notes.push("phương pháp: " + mm.join(", "));
+
+            // Dự báo tính trên nền chuỗi 24h, "Hiện tại" là mẫu tức thời:
+            // nếu lệch quá tốc độ cho phép thì nói rõ để không tưởng là lỗi.
+            const jump = ORDER.some(k => {
+                const cur = pred.current ? pick(pred.current, k) : null;
+                const head = (pred.forecast && pred.forecast[k]) ? pred.forecast[k][0] : null;
+                return cur !== null && head !== null && Math.abs(head - cur) > METRICS[k].rate;
+            });
+            if (jump) notes.push("dự báo tính từ nền 24 giờ nên có thể lệch mẫu tức thời");
+
+            $("ai-notes").textContent = notes.join(" · ");
         }
 
         async function refreshAI() {
             try {
-                // Đọc từ Firebase thay vì gọi server Python
                 const data = await getJSON("/predictions/latest.json");
-                if (!data) {
-                    pred = null;
-                    renderPred();
-                    return;
-                }
-
-                // Chuyển đổi dữ liệu từ forecast.py sang cấu trúc mà renderPred mong muốn
-                pred = {
-                    status: "ok",
-                    generatedAt: data.timestamp * 1000,
-                    risk: {
-                        level: data.level === "danger" ? 2 : (data.level === "warn" ? 1 : 0),
-                        text: data.level === "danger" ? "NGUY HIỂM" : (data.level === "warn" ? "CẢNH BÁO" : "BÌNH THƯỜNG"),
-                        reasons: data.issues || []
-                    },
-                    summary: data.issues.length ? "Phát hiện các vấn đề cần chú ý." : "Tất cả các chỉ số trong ngưỡng an toàn.",
-                    current: data.latest,
-                    forecast: {}
-                };
-
-                // Chuyển đổi mảng dự báo
-                Object.keys(data.forecasts).forEach(k => {
-                    const fc = data.forecasts[k];
-                    if (fc && fc.value !== null) {
-                        // Giả lập mảng dự báo 6h (vì forecast.py hiện tại chỉ trả về 1 giá trị cuối)
-                        // Tạo một mảng giả có 6 phần tử, các phần tử trước bằng giá trị hiện tại, phần tử cuối là giá trị dự báo
-                        const val = fc.value;
-                        pred.forecast[k] = [val, val, val, val, val, val];
-                    }
-                });
-
+                pred = data && data.schema ? data : (data ? migrateLegacy(data) : null);
                 renderPred();
-
-                // Hiển thị thời tiết so sánh
-                if (data.external_context) {
-                    $("city-temp").textContent = data.external_context.city_temp ?? "—";
-                    $("city-hum").textContent = "Độ ẩm: " + (data.external_context.city_humidity ?? "—") + "%";
-                    $("city-pm25").textContent = data.external_context.city_pm25 ?? "—";
-                    $("city-pm25-fc").textContent = "Dự báo 6h: " + (data.external_context.city_pm25_forecast_6h ?? "—") + " µg/m³";
+                if (pred && pred.external) {
+                    const ext = pred.external;
+                    $("city-temp").textContent = fmt(ext.cityTemp, 1);
+                    $("city-hum").textContent = "Độ ẩm: " + fmt(ext.cityHum, 1) + "%";
+                    $("city-pm25").textContent = fmt(ext.cityPm25, 1);
+                    $("city-pm25-fc").textContent = "Dự báo 6h: " + fmt(ext.cityPm25Forecast6h, 1) + " µg/m³";
                 }
-
             } catch (e) {
                 console.error("AI refresh error:", e);
                 pred = null;
                 renderPred();
             }
+            drawChart();
+        }
+
+        // Tương thích ngược: đọc payload cũ (forecast.py bản cũ ghi /ai_analysis)
+        function migrateLegacy(d) {
+            const lv = d.level === "danger" ? 2 : (d.level === "warn" ? 1 : 0);
+            const forecast = {};
+            const src = d.forecasts || d.forecast || {};
+            Object.keys(src).forEach(k => {
+                const item = src[k];
+                const key = k === "t" ? "temp" : k === "h" ? "hum" : k;
+                if (item && Array.isArray(item)) forecast[key] = item;
+                else if (item && typeof item.value === "number") forecast[key] = [item.value, null, null, null, null, item.value];
+            });
+            return {
+                status: "ok",
+                schema: 1,
+                generatedAt: (d.timestamp || 0) * 1000,
+                baseTs: 0, binMinutes: 60, horizons: [60, 120, 180, 240, 300, 360],
+                risk: { level: lv, text: lv === 2 ? "NGUY HIỂM" : lv === 1 ? "CẢNH BÁO" : "BÌNH THƯỜNG", reasons: d.issues || [] },
+                summary: (d.issues || []).length ? "Phát hiện các vấn đề cần chú ý." : "Tất cả các chỉ số trong ngưỡng an toàn.",
+                current: d.latest || {},
+                forecast: forecast,
+                trend: {}, thresholds: {},
+                quality: { samples: null },
+                external: d.external_context || null
+            };
         }
 
         async function refreshDaily() {
@@ -570,21 +632,22 @@
                 const since = Math.floor(Date.now() / 1000) - 86400;
                 const q = "?orderBy=" + encodeURIComponent('"$key"') + "&startAt=" + encodeURIComponent('"' + since + '"');
                 const o = await getJSON("/history.json" + q);
-                const vals = { t: [], h: [], dust: [] };
+                const vals = { temp: [], hum: [], dust: [] };
                 let n = 0;
                 if (o) {
                     for (const k in o) {
                         const p = o[k];
                         if (!p) continue;
                         n++;
-                        for (const m of ["t", "h", "dust"]) {
-                            if (typeof p[m] === "number") vals[m].push(p[m]);
+                        for (const m of ["temp", "hum", "dust"]) {
+                            const v = pick(p, m);
+                            if (v !== null) vals[m].push(v);
                         }
                     }
                 }
                 const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
-                $("a-temp").textContent = fmt(avg(vals.t), 1);
-                $("a-hum").textContent = fmt(avg(vals.h), 1);
+                $("a-temp").textContent = fmt(avg(vals.temp), 1);
+                $("a-hum").textContent = fmt(avg(vals.hum), 1);
                 $("a-dust").textContent = fmt(avg(vals.dust), 0);
                 $("a-note").textContent = n
                     ? "Tính từ " + n + " mẫu (mỗi mẫu là trung bình 1 phút) trong 24 giờ qua."
@@ -605,7 +668,6 @@
                 document.querySelectorAll("[data-range]").forEach(x => x.classList.toggle("on", x === b));
             }
             refreshHistory();
-            drawChart();
         });
 
         // Khởi chạy
@@ -618,7 +680,7 @@
         setInterval(refreshLatest, 5000);
         setInterval(refreshHistory, 60000);
         setInterval(refreshDaily, 300000);
-        setInterval(refreshAI, 300000); // Cập nhật AI mỗi 5 phút
+        setInterval(refreshAI, 300000);
     </script>
 </body>
 
