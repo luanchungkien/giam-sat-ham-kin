@@ -19,11 +19,16 @@ Biến môi trường:
     ENABLE_WEATHER      "0" để tắt gọi Open-Meteo
     SITE_LAT / SITE_LON / SITE_NAME / SITE_TZ  trạm so sánh thời tiết (mặc định Thái Nguyên)
     AI_BIAS_DECAY_MIN   hằng số tắt dần khi neo dự báo vào giá trị hiện tại (phút)
+    AI_REVERT_MIN       hằng số hồi quy về mức nền 24 giờ (phút), mặc định 360
+
+Mô hình dự báo:
+    6 mốc cách nhau 2 giờ, xa nhất 12 giờ. Dùng hồi quy về trung vị 24 giờ
+    (damped mean reversion) thay cho ngoại suy tuyến tính/ARIMA, vì ở tầm 12 giờ
+    hai mô hình kia cho ra đường phẳng (mọi mốc trùng nhau) hoặc số vô lý.
 
 Phụ thuộc:
     bắt buộc : numpy
-    tuỳ chọn : statsmodels (ARIMA), scikit-learn (IsolationForest)
-               -> nếu không có, tự động dùng fallback nội suy tuyến tính / z-score.
+    tuỳ chọn : scikit-learn (IsolationForest) -> thiếu thì dùng z-score.
 """
 
 from __future__ import annotations
@@ -40,12 +45,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-try:  # dự báo chuỗi thời gian
-    from statsmodels.tsa.arima.model import ARIMA
-except Exception:  # pragma: no cover - môi trường không có statsmodels
-    ARIMA = None
-
-try:  # phát hiện bất thường đa chiều
+try:  # phát hiện bất thường đa chiều (tuỳ chọn — thiếu thì dùng z-score)
     from sklearn.ensemble import IsolationForest
     from sklearn.preprocessing import StandardScaler
 except Exception:  # pragma: no cover - môi trường không có sklearn
@@ -76,8 +76,10 @@ BIAS_DECAY_MIN = float(os.environ.get("AI_BIAS_DECAY_MIN", "120"))
 
 SCHEMA_VERSION = 2
 
-# Các mốc dự báo (phút kể từ điểm dữ liệu cuối cùng)
-HORIZONS = (60, 120, 180, 240, 300, 360)
+# Các mốc dự báo (phút kể từ điểm dữ liệu cuối cùng): cách nhau 2 giờ, xa nhất 12 giờ
+HORIZONS = (120, 240, 360, 480, 600, 720)
+BIN_MINUTES = HORIZONS[0]          # bước giữa hai cột (phút)
+HORIZON_HOURS = HORIZONS[-1] // 60  # mốc xa nhất, dùng cho câu tóm tắt
 
 # Ngưỡng mặc định. PHẢI KHỚP với ngưỡng trong firmware:
 #   DUST_WARN_UG = 500  -> dust warn 500 / danger 800
@@ -217,6 +219,7 @@ def fetch_data(path, query=None):
 
 
 def push_data(path, data):
+    print("[AI] Đang ghi /{} ...".format(path))
     _request("PUT", _url(path), data)
     print("[AI] Đã ghi Firebase /{}".format(path))
 
@@ -326,30 +329,29 @@ def trend_per_hour(series, window_min=60.0):
 
 
 # ============================ DỰ BÁO ============================
-def _fallback_forecast(series, horizons):
-    """Ngoại suy tuyến tính có giảm dần (damped) - dùng khi không có statsmodels."""
-    window = min(len(series), 120)
-    pts = series[-window:]
-    x = np.array([t for t, _ in pts], dtype=float)
-    y = np.array([v for _, v in pts], dtype=float)
-    x = (x - x[-1]) / 60.0  # phút, mốc 0 = điểm cuối
-    if x.size >= 3 and float(np.ptp(x)) > 0:
-        slope, intercept = np.polyfit(x, y, 1)
-    else:
-        slope, intercept = 0.0, float(y[-1])
-    last = float(y[-1])
-    out = []
-    for horizon in horizons:
-        damp = 1.0 / (1.0 + horizon / 240.0)
-        out.append(last + float(slope) * horizon * damp)
-    return out, "linear"
+
+REVERT_MIN = float(os.environ.get("AI_REVERT_MIN", "360"))
+
+
+def _revert_forecast(values, horizons):
+    """Hồi quy về mức nền 24 giờ (damped mean reversion).
+
+    Với tầm dự báo 2–12 giờ, cả ngoại suy tuyến tính lẫn ARIMA(1,1,1) đều cho
+    ra đường gần như phẳng (mọi mốc trùng nhau) hoặc văng ra số vô lý khi chuỗi
+    có cú nhảy. Mô hình ở đây: xuất phát từ mẫu cuối rồi tiến dần về trung vị
+    24 giờ theo hàm mũ — nên mỗi mốc một khác, và không bao giờ ra ngoài dải
+    đã từng đo.
+    """
+    last = float(values[-1])
+    base = float(np.percentile(values, 50))
+    return [base + (last - base) * math.exp(-h / REVERT_MIN) for h in horizons]
 
 
 def forecast_metric(series, metric, horizons=HORIZONS, anchor=None):
-    """Trả về (list giá trị dự báo cùng độ dài horizons, phương pháp) hoặc (None, lý do).
+    """Trả về (list giá trị dự báo cùng độ dài horizons, phương pháp).
 
     `anchor`: giá trị cảm biến hiện tại. Dự báo được neo vào giá trị này rồi
-    tắt dần sai lệch (BIAS_DECAY_MIN), nhờ vậy điểm +1h không nhảy cóc so với
+    tắt dần sai lệch (BIAS_DECAY_MIN), nhờ vậy mốc +2h không nhảy cóc so với
     số đang hiển thị trên dashboard.
     """
     spec = METRICS[metric]
@@ -357,35 +359,8 @@ def forecast_metric(series, metric, horizons=HORIZONS, anchor=None):
         return None, "insufficient"
 
     values = np.array([v for _, v in series], dtype=float)
-    ts = np.array([t for t, _ in series], dtype=float)
-    diffs = np.diff(ts)
-    diffs = diffs[diffs > 0]
-    step_sec = float(np.median(diffs)) if diffs.size else 60.0
-    step_sec = max(30.0, min(900.0, step_sec))  # 30s..15min
-
-    raw, method = None, None
-    if ARIMA is not None and values.size >= 60 and float(np.std(values)) > 1e-6:
-        max_steps = max(int(round(h * 60.0 / step_sec)) for h in horizons)
-        try:
-            model = ARIMA(
-                values,
-                order=(1, 1, 1),
-                enforce_stationarity=False,
-                enforce_invertibility=False,
-            ).fit()
-            forecast = np.asarray(model.forecast(steps=max_steps), dtype=float)
-            if forecast.size >= 1:
-                raw = []
-                for horizon in horizons:
-                    idx = int(round(horizon * 60.0 / step_sec)) - 1
-                    idx = max(0, min(forecast.size - 1, idx))
-                    raw.append(float(forecast[idx]))
-                method = "arima"
-        except Exception as exc:  # ARIMA rất dễ "nổ" với chuỗi ngắn/phẳng
-            print("[AI] ARIMA lỗi cho {}: {}".format(metric, exc))
-
-    if raw is None:
-        raw, method = _fallback_forecast(series, horizons)
+    raw = _revert_forecast(values, horizons)
+    method = "mean-revert"
 
     # Neo vào giá trị hiện tại: lệch giữa "mẫu cuối của chuỗi" và "cảm biến bây giờ"
     # được cộng vào dự báo rồi tắt dần, để đường dự báo nối liền với số đang hiển thị.
@@ -397,14 +372,18 @@ def forecast_metric(series, metric, horizons=HORIZONS, anchor=None):
         for horizon, value in zip(horizons, raw)
     ]
 
-    # Kẹp tốc độ biến thiên: dự báo 6 giờ không thể nhảy xa hơn `rate` mỗi giờ,
-    # tránh trường hợp ARIMA/ngoại suy tuyến tính cho ra con số vô lý.
+    # Kẹp tốc độ biến thiên: mỗi giờ không đổi quá `rate`
     limited = []
     for horizon, value in zip(horizons, corrected):
         span = spec["rate"] * horizon / 60.0
         limited.append(max(reference - span, min(reference + span, value)))
 
-    # Kẹp về khoảng vật lý hợp lý để không hiển thị số vô lý
+    # Kẹp vào DẢI ĐÃ QUAN SÁT trong 24h (p2..p98, mở rộng để chứa giá trị hiện tại)
+    lo_obs = min(float(np.percentile(values, 2)), reference)
+    hi_obs = max(float(np.percentile(values, 98)), reference)
+    limited = [max(lo_obs, min(hi_obs, v)) for v in limited]
+
+    # Kẹp về khoảng vật lý của cảm biến
     cleaned = [
         _r(max(spec["lo"], min(spec["hi"], v)), spec["dec"]) for v in limited
     ]
@@ -607,23 +586,26 @@ def build_summary(level, trends, forecasts):
 
     parts = [head]
     for metric in ("temp", "dust"):
-        trend = trends.get(metric)
-        values = forecasts.get(metric)
-        if trend is None or not values or values[-1] is None:
+        values = forecasts.get(metric) or []
+        if len(values) < 2 or values[0] is None or values[-1] is None:
             continue
         spec = METRICS[metric]
-        if abs(trend) < 0.2:
+        first, last = float(values[0]), float(values[-1])
+        # Nói theo đúng đường dự báo (mốc đầu -> mốc cuối), không dùng độ dốc 1 giờ
+        # để tránh câu "dự báo giảm" trong khi đường dự báo lại đi lên.
+        scale = max(0.5, abs(first) * 0.03)
+        if abs(last - first) < scale:
             word = "ổn định"
         else:
-            word = "tăng" if trend > 0 else "giảm"
+            word = "tăng" if last > first else "giảm"
         parts.append(
-            "{} dự báo {} ({:+.1f}{}/giờ, còn {:.1f}{} sau 6 giờ).".format(
+            "{} dự báo {} ({:.1f} → {:.1f}{} sau {} giờ).".format(
                 spec["label"],
                 word,
-                trend,
+                first,
+                last,
                 spec["unit"],
-                values[-1],
-                spec["unit"],
+                HORIZON_HOURS,
             )
         )
     return " ".join(parts)
@@ -680,7 +662,7 @@ def analyse(dry_run=False, out_file=None):
         "generatedAt": started * 1000,
         "timestamp": started,
         "baseTs": int(base_ts),
-        "binMinutes": 60,
+        "binMinutes": BIN_MINUTES,
         "horizons": list(HORIZONS),
         "risk": {
             "level": level,
@@ -740,8 +722,27 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         payload = analyse(dry_run=args.dry_run, out_file=args.out)
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        if exc.code in (401, 403):
+            print("[AI] Firebase từ chối quyền: HTTP {} {}".format(exc.code, exc.reason),
+                  file=sys.stderr)
+            print("[AI] Nghĩa là Rules đang chặn ghi /predictions/latest khi chưa đăng nhập.",
+                  file=sys.stderr)
+            print("[AI] Sửa: Firebase Console → Realtime Database → Rules, thêm dòng:", file=sys.stderr)
+            print('        "predictions": { ".read": true, ".write": true }', file=sys.stderr)
+            print("[AI] (hoặc đặt secret FIREBASE_DB_AUTH và bỏ comment trong forecast.yml)",
+                  file=sys.stderr)
+        else:
+            print("[AI] Lỗi HTTP {}: {} {}".format(exc.code, exc.reason, body), file=sys.stderr)
+        return 2
     except urllib.error.URLError as exc:
-        print("[AI] Lỗi mạng: {}".format(exc), file=sys.stderr)
+        print("[AI] Lỗi mạng: {}".format(getattr(exc, "reason", exc)), file=sys.stderr)
+        print("[AI] Kiểm tra FIREBASE_DB_URL và kết nối của runner.", file=sys.stderr)
         return 2
     return 0 if payload is not None else 1
 
