@@ -351,6 +351,7 @@
         // Đọc được cả history cũ của firmware <= 1.0.1 (ghi "t"/"h")
         const ALIAS = { temp: ["temp", "t"], hum: ["hum", "h"], dust: ["dust"], mq2: ["mq2"] };
         const STALE_MS = 30000;
+        const STALE_AI_MIN = 360;            // dự báo quá 6 giờ mới coi là "cũ"
 
         // Trạm so sánh: Thái Nguyên. Dashboard tự gọi Open-Meteo nên thời tiết
         // luôn cập nhật, không phụ thuộc job AI có chạy hay không.
@@ -607,19 +608,36 @@
 
             const notes = [];
             const q = pred.quality || {};
-            if (q.samples) notes.push(q.samples + " mẫu" + (q.coverageHours ? " / " + q.coverageHours + " giờ" : ""));
-            if (q.stale) notes.push("dữ liệu đã cũ " + Math.round(q.ageSec) + "s");
+            if (q.samples) {
+                const span = q.coverageHours ? " · " + Math.round(q.coverageHours) + " giờ dữ liệu" : "";
+                notes.push(q.samples + " mẫu" + span);
+            }
+            if (q.stale) notes.push("số liệu cảm biến đã cũ " + Math.round(q.ageSec) + "s");
             if (pred.generatedAt) {
                 const ageMin = (Date.now() - pred.generatedAt) / 60000;
-                if (ageMin > 45) notes.push("dự báo đã cũ " + Math.round(ageMin) + " phút — kiểm tra GitHub Actions");
+                // GitHub Actions cron là "best-effort" nên có lúc chạy trễ vài giờ.
+                // Dự báo 2–12 giờ vẫn còn dùng được trong 6 giờ, nên chỉ nhắc khi
+                // thật sự quá cũ; mốc 90 phút chỉ ghi nhẹ để không gây hoang mang.
+                if (ageMin >= STALE_AI_MIN) {
+                    notes.push("dự báo cũ " + (ageMin / 60).toFixed(1) + " giờ — job AI chưa chạy lại (GitHub Actions)");
+                } else if (ageMin >= 90) {
+                    notes.push("dự báo cập nhật " + Math.round(ageMin) + " phút trước");
+                }
             }
             if (pred.status && pred.status !== "ok") notes.push("chưa đủ dữ liệu lịch sử để dự báo");
-            if (pred.anomaly && pred.anomaly.method && pred.anomaly.method !== "none") {
-                notes.push("bất thường: " + pred.anomaly.method);
+
+            // Chỉ báo khi THỰC SỰ phát hiện bất thường; bình thường không in tên
+            // thuật toán ra (trước đây in "bất thường: isolation_forest" gây hiểu nhầm).
+            const an = pred.anomaly || {};
+            if (an.isAnomaly === true) {
+                notes.push("phát hiện bất thường đa chiều (" + (an.method || "z-score") + ", điểm " + an.score + ")");
             }
+
+            // Tên mô hình dự báo, diễn giải cho dễ đọc
+            const METHOD_TEXT = { "mean-revert": "hồi quy về mức nền 24 giờ", "insufficient": "chưa đủ dữ liệu" };
             const methods = pred.forecastMethod ? Object.values(pred.forecastMethod) : [];
             const mm = Array.from(new Set(methods.filter(Boolean)));
-            if (mm.length) notes.push("phương pháp: " + mm.join(", "));
+            if (mm.length) notes.push("mô hình: " + mm.map(x => METHOD_TEXT[x] || x).join(", "));
 
             // Dự báo tính trên nền chuỗi 24h, "Hiện tại" là mẫu tức thời:
             // nếu lệch quá tốc độ cho phép thì nói rõ để không tưởng là lỗi.
