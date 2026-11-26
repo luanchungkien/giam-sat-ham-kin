@@ -273,15 +273,15 @@
             </div>
         </section>
 
-        <div class="section-title">So sánh với thành phố</div>
+        <div class="section-title">So sánh với Thái Nguyên</div>
         <section class="grid">
             <div class="card">
-                <div class="label">Thời tiết TP</div>
+                <div class="label">Thời tiết Thái Nguyên</div>
                 <div class="value"><span id="city-temp">—</span><span class="unit">°C</span></div>
                 <div class="note" id="city-hum">Độ ẩm: —</div>
             </div>
             <div class="card">
-                <div class="label">Bụi TP (PM2.5)</div>
+                <div class="label">Bụi Thái Nguyên (PM2.5)</div>
                 <div class="value"><span id="city-pm25">—</span><span class="unit">µg/m³</span></div>
                 <div class="note" id="city-pm25-fc">Dự báo 6h: —</div>
             </div>
@@ -352,7 +352,13 @@
         const ALIAS = { temp: ["temp", "t"], hum: ["hum", "h"], dust: ["dust"], mq2: ["mq2"] };
         const STALE_MS = 30000;
 
+        // Trạm so sánh: Thái Nguyên. Dashboard tự gọi Open-Meteo nên thời tiết
+        // luôn cập nhật, không phụ thuộc job AI có chạy hay không.
+        const SITE = { name: "Thái Nguyên", lat: 21.5942, lon: 105.8481, tz: "Asia/Ho_Chi_Minh" };
+
         let metric = "temp", rangePts = 60, chart = null;
+        let latestData = null;               // /latest mới nhất, dùng cho cột "Hiện tại"
+        const currentCells = {};             // ô "Hiện tại" của bảng AI, cập nhật mỗi 5 giây
         const $ = id => document.getElementById(id);
         const fmt = (v, d) => (v === null || v === undefined || isNaN(v)) ? "—" : Number(v).toFixed(d);
 
@@ -383,13 +389,35 @@
             b.textContent = text || "";
         }
 
+        // ===== Giá trị "hiện tại" dùng chung =====
+        // Ưu tiên /latest (cảm biến, cập nhật 5 giây/lần) rồi mới tới ảnh chụp
+        // trong payload AI, để cột "Hiện tại" không bao giờ lệch với thẻ phía trên.
+        function liveValue(k) {
+            const live = pick(latestData, k);
+            if (live !== null) return live;
+            return pred && pred.current ? pick(pred.current, k) : null;
+        }
+
+        function updateCurrentCells() {
+            if (!pred) return;
+            ORDER.forEach(k => {
+                const td = currentCells[k];
+                if (!td) return;
+                const value = liveValue(k);
+                td.textContent = fmt(value, METRICS[k].dec) + " " + METRICS[k].unit;
+                td.className = levelClass(value, (pred.thresholds || {})[k]);
+            });
+        }
+
         // ===== Dữ liệu mới nhất =====
         async function refreshLatest() {
             try {
                 const d = await getJSON("/latest.json");
                 if (!d) { setStatus("Chưa có dữ liệu trong /latest", false); return; }
+                latestData = d;
 
                 ORDER.forEach(k => { $("v-" + k).textContent = fmt(pick(d, k), METRICS[k].dec); });
+                updateCurrentCells();        // giữ cột "Hiện tại" luôn khớp cảm biến
 
                 const rs485 = d.modbusOk === false ? "mất kết nối RS485" : "";
                 $("n-temp").textContent = rs485;
@@ -452,7 +480,10 @@
                 const base = pred.baseTs || lastLabels.length;
                 const bin = pred.binMinutes || 60;
                 const last = hist.length - 1;
-                if (hist[last] !== null) fc[last] = hist[last];
+                // Nối nét đứt từ giá trị cảm biến hiện tại để không có "vách đứng"
+                const anchor = liveValue(metric);
+                if (anchor !== null) fc[last] = anchor;
+                else if (hist[last] !== null) fc[last] = hist[last];
                 series.forEach((v, i) => {
                     labels.push(fmtLabel(base + (i + 1) * bin * 60, rangePts > 60));
                     hist.push(null);
@@ -513,6 +544,7 @@
         function renderPred() {
             const risk = $("ai-risk"), rows = $("ai-rows"), reasons = $("ai-reasons"), head = $("ai-head");
             rows.textContent = ""; reasons.textContent = ""; head.textContent = ""; $("ai-notes").textContent = "";
+            ORDER.forEach(k => delete currentCells[k]);
 
             if (!pred) {
                 risk.textContent = "—"; risk.className = "badge lv0";
@@ -544,11 +576,11 @@
             const thresholds = pred.thresholds || {};
             ORDER.forEach(k => {
                 const spec = METRICS[k];
-                const cur = pred.current ? pick(pred.current, k) : null;
+                const cur = liveValue(k);           // luôn lấy từ cảm biến /latest
                 const fc = (pred.forecast && pred.forecast[k]) || [];
                 const tr = document.createElement("tr");
                 cell(tr, spec.label);
-                cell(tr, fmt(cur, spec.dec) + " " + spec.unit, levelClass(cur, thresholds[k]));
+                currentCells[k] = cell(tr, fmt(cur, spec.dec) + " " + spec.unit, levelClass(cur, thresholds[k]));
                 horizons.forEach((h, i) => cell(tr, fc[i] === null || fc[i] === undefined ? "—" : fmt(fc[i], spec.dec)));
                 const trend = pred.trend ? pred.trend[k] : null;
                 cell(tr, (trend === null || trend === undefined)
@@ -561,6 +593,10 @@
             const q = pred.quality || {};
             if (q.samples) notes.push(q.samples + " mẫu" + (q.coverageHours ? " / " + q.coverageHours + " giờ" : ""));
             if (q.stale) notes.push("dữ liệu đã cũ " + Math.round(q.ageSec) + "s");
+            if (pred.generatedAt) {
+                const ageMin = (Date.now() - pred.generatedAt) / 60000;
+                if (ageMin > 45) notes.push("dự báo đã cũ " + Math.round(ageMin) + " phút — kiểm tra GitHub Actions");
+            }
             if (pred.status && pred.status !== "ok") notes.push("chưa đủ dữ liệu lịch sử để dự báo");
             if (pred.anomaly && pred.anomaly.method && pred.anomaly.method !== "none") {
                 notes.push("bất thường: " + pred.anomaly.method);
@@ -572,7 +608,7 @@
             // Dự báo tính trên nền chuỗi 24h, "Hiện tại" là mẫu tức thời:
             // nếu lệch quá tốc độ cho phép thì nói rõ để không tưởng là lỗi.
             const jump = ORDER.some(k => {
-                const cur = pred.current ? pick(pred.current, k) : null;
+                const cur = liveValue(k);
                 const head = (pred.forecast && pred.forecast[k]) ? pred.forecast[k][0] : null;
                 return cur !== null && head !== null && Math.abs(head - cur) > METRICS[k].rate;
             });
@@ -586,19 +622,78 @@
                 const data = await getJSON("/predictions/latest.json");
                 pred = data && data.schema ? data : (data ? migrateLegacy(data) : null);
                 renderPred();
-                if (pred && pred.external) {
-                    const ext = pred.external;
-                    $("city-temp").textContent = fmt(ext.cityTemp, 1);
-                    $("city-hum").textContent = "Độ ẩm: " + fmt(ext.cityHum, 1) + "%";
-                    $("city-pm25").textContent = fmt(ext.cityPm25, 1);
-                    $("city-pm25-fc").textContent = "Dự báo 6h: " + fmt(ext.cityPm25Forecast6h, 1) + " µg/m³";
-                }
             } catch (e) {
                 console.error("AI refresh error:", e);
                 pred = null;
                 renderPred();
             }
             drawChart();
+            applyCityFromAI();     // chỉ dùng khi trình duyệt không gọi được Open-Meteo
+        }
+
+        // ===== Thời tiết Thái Nguyên: trình duyệt gọi trực tiếp Open-Meteo =====
+        // Nhờ vậy thẻ thành phố luôn có số, không phụ thuộc job AI còn chạy hay không.
+        let cityFromApi = false;
+
+        async function refreshWeather() {
+            try {
+                const url = "https://api.open-meteo.com/v1/forecast?latitude=" + SITE.lat +
+                    "&longitude=" + SITE.lon +
+                    "&current=temperature_2m,relative_humidity_2m&timezone=" + encodeURIComponent(SITE.tz);
+                const w = await (await fetch(url)).json();
+                const now = (w && w.current) || {};
+                if (typeof now.temperature_2m === "number") $("city-temp").textContent = fmt(now.temperature_2m, 1);
+                if (typeof now.relative_humidity_2m === "number") {
+                    $("city-hum").textContent = "Độ ẩm: " + fmt(now.relative_humidity_2m, 1) + "%";
+                }
+                cityFromApi = true;
+            } catch (e) {
+                console.error("weather error:", e);
+            }
+
+            try {
+                const url = "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=" + SITE.lat +
+                    "&longitude=" + SITE.lon + "&current=pm2_5&hourly=pm2_5&timezone=UTC&forecast_days=1";
+                const a = await (await fetch(url)).json();
+                const now = (a && a.current) || {};
+                if (typeof now.pm2_5 === "number") $("city-pm25").textContent = fmt(now.pm2_5, 1);
+
+                const hourly = (a && a.hourly) || {};
+                const times = hourly.time || [], values = hourly.pm2_5 || [];
+                const key = new Date().toISOString().slice(0, 13) + ":00";   // giờ UTC hiện tại
+                const idx = times.indexOf(key);
+                if (idx >= 0 && idx + 6 < values.length && typeof values[idx + 6] === "number") {
+                    $("city-pm25-fc").textContent = "Dự báo 6h: " + fmt(values[idx + 6], 1) + " µg/m³";
+                }
+                cityFromApi = true;
+            } catch (e) {
+                console.error("air quality error:", e);
+            }
+        }
+
+        function applyCityFromAI() {
+            if (cityFromApi || !pred || !pred.external) return;
+            const ext = normalizeExternal(pred.external);
+            if (!ext) return;
+            if (typeof ext.cityTemp === "number") $("city-temp").textContent = fmt(ext.cityTemp, 1);
+            if (typeof ext.cityHum === "number") $("city-hum").textContent = "Độ ẩm: " + fmt(ext.cityHum, 1) + "%";
+            if (typeof ext.cityPm25 === "number") $("city-pm25").textContent = fmt(ext.cityPm25, 1);
+            if (typeof ext.cityPm25Forecast6h === "number") {
+                $("city-pm25-fc").textContent = "Dự báo 6h: " + fmt(ext.cityPm25Forecast6h, 1) + " µg/m³";
+            }
+        }
+
+        // Chấp nhận cả camelCase (schema v2) và snake_case (payload cũ)
+        function normalizeExternal(ext) {
+            if (!ext) return null;
+            const pickKey = (camel, snake) => (ext[camel] !== undefined ? ext[camel] : ext[snake]);
+            return {
+                city: ext.city,
+                cityTemp: pickKey("cityTemp", "city_temp"),
+                cityHum: pickKey("cityHum", "city_humidity"),
+                cityPm25: pickKey("cityPm25", "city_pm25"),
+                cityPm25Forecast6h: pickKey("cityPm25Forecast6h", "city_pm25_forecast_6h")
+            };
         }
 
         // Tương thích ngược: đọc payload cũ (forecast.py bản cũ ghi /ai_analysis)
@@ -623,7 +718,7 @@
                 forecast: forecast,
                 trend: {}, thresholds: {},
                 quality: { samples: null },
-                external: d.external_context || null
+                external: normalizeExternal(d.external_context)
             };
         }
 
@@ -675,12 +770,14 @@
         refreshHistory();
         refreshDaily();
         refreshAI();
+        refreshWeather();
 
         // Định kỳ cập nhật
         setInterval(refreshLatest, 5000);
         setInterval(refreshHistory, 60000);
         setInterval(refreshDaily, 300000);
         setInterval(refreshAI, 300000);
+        setInterval(refreshWeather, 600000);   // thời tiết: 10 phút
     </script>
 </body>
 
