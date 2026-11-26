@@ -516,7 +516,7 @@
         async function refreshAI() {
             try {
                 // Đọc từ Firebase thay vì gọi server Python
-                const data = await getJSON("/ai_analysis.json");
+                const data = await getJSON("/predictions/latest.json");
                 if (!data) {
                     pred = null;
                     renderPred();
